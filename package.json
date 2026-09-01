@@ -1,0 +1,14 @@
+{
+  "name": "prisma-audit-monorepo",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "pnpm --filter prisma-audit build",
+    "test": "pnpm --filter prisma-audit test",
+    "demo": "pnpm --filter demo demo"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3"
+  },
+  "packageManager": "pnpm@11.25.0"
+}

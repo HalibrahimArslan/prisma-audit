@@ -1,0 +1,53 @@
+// This is the schema you edit. It uses prisma-audit annotations, so it is not
+// handed to the Prisma CLI directly: `prisma-audit generate` strips them and
+// writes a Prisma-ready schema into prisma/.audit.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+// Prisma 7 takes the connection URL from prisma.config.ts and from the driver
+// adapter passed to PrismaClient, not from the schema.
+datasource db {
+  provider = "postgresql"
+}
+
+enum Currency {
+  TRY
+  USD
+}
+
+[Auditable]
+model Product {
+  id       Int      @id @default(autoincrement())
+  name     String
+  price    Decimal  @db.Decimal(12, 2)
+  currency Currency @default(TRY)
+
+  // Internal bookkeeping that should never end up in the audit trail.
+  [NotAudited]
+  internalCode String?
+
+  categoryId Int?
+  category   Category? @relation(fields: [categoryId], references: [id])
+
+  createdAt DateTime @default(now())
+
+  [NotAudited]
+  updatedAt DateTime @updatedAt
+}
+
+[Auditable]
+model Stock {
+  id        Int @id @default(autoincrement())
+  productId Int @unique
+  quantity  Int
+}
+
+// Not annotated: writes to Category leave no audit trail.
+model Category {
+  id       Int       @id @default(autoincrement())
+  name     String
+  products Product[]
+}

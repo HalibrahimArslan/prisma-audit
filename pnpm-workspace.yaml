@@ -1,0 +1,10 @@
+packages:
+  - "packages/*"
+  - "examples/*"
+
+# Prisma downloads its query engine and esbuild its native binary in a
+# postinstall script; both are required for the demo to run.
+allowBuilds:
+  '@prisma/engines': true
+  esbuild: true
+  prisma: true

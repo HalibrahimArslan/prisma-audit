@@ -1,0 +1,33 @@
+{
+  "name": "prisma-audit",
+  "version": "0.1.0",
+  "description": "Hibernate Envers style auditing for Prisma: [Auditable] annotations, generated *Aud tables, a central Revision table and an AuditReader.",
+  "type": "module",
+  "license": "MIT",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "bin": {
+    "prisma-audit": "./dist/cli/bin.js"
+  },
+  "files": ["dist", "README.md"],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "test": "tsc -p tsconfig.json --noEmit false && node --test dist-test/test/*.test.js",
+    "clean": "rm -rf dist dist-test"
+  },
+  "peerDependencies": {
+    "@prisma/client": ">=6"
+  },
+  "peerDependenciesMeta": {
+    "@prisma/client": { "optional": true }
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.3",
+    "typescript": "^5.9.3"
+  },
+  "engines": { "node": ">=20" }
+}
