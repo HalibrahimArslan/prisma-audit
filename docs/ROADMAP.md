@@ -103,7 +103,12 @@ same transaction — the documented cost is that one statement becomes two.
   currently audits only the top-level model. The gap is at least loud now — a
   nested write that reaches an `[Auditable]` model warns once per relation.
 - Relation auditing strategies, e.g. auditing an aggregate together with its children.
-- Configurable audit table naming (`[AuditTable(ProductHistory)]`).
+- ✅ Configurable audit table naming. `[AuditTable(ProductHistory)]` names the
+  generated model and derives the table from it; `[AuditTable("product_history")]`
+  names the table alone, for an audit table that already exists. Annotations now
+  stack on one declaration, which is what let a second one sit above a model,
+  and generated names are checked against everything the schema declares —
+  including the `Revision` model prisma-audit emits itself.
 
 ## M6 — Enforcement below the application
 

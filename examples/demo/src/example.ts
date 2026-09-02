@@ -223,8 +223,10 @@ async function report(productId: number): Promise<void> {
   }
 
   // A deleted row still answers "did this ever exist, and what was it?".
+  // Stock is [AuditTable(StockHistory)]: the reader is still asked for "Stock",
+  // the model as the schema names it, and finds its history in stock_history.
   const stockHistory = await prisma.audit.for("Stock").id(1).getRevisions();
-  console.log("\n── Stock history (row was deleted) ─────────────────────────");
+  console.log("\n── Stock history (in the renamed audit table) ──────────────");
   for (const entry of stockHistory) {
     const entity = entry.entity as Record<string, unknown>;
     console.log(
@@ -258,7 +260,7 @@ function summarise(entity: unknown): string {
 /** Start from a clean slate so the demo can be run repeatedly. */
 async function reset(): Promise<void> {
   await prisma.$executeRawUnsafe(
-    'TRUNCATE TABLE "product_aud", "stock_aud", "order_line_aud", "revision", "Stock", "Product", "OrderLine", "Category" RESTART IDENTITY CASCADE',
+    'TRUNCATE TABLE "product_aud", "stock_history", "order_line_aud", "revision", "Stock", "Product", "OrderLine", "Category" RESTART IDENTITY CASCADE',
   );
 }
 

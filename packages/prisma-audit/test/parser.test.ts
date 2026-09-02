@@ -122,6 +122,92 @@ describe("parser", () => {
     assert.equal(parsed.metadata.models[0]?.auditable, false);
   });
 
+  it("names the audit model, and derives the table, from [AuditTable(Name)]", () => {
+    const { metadata } = parseSchemaText(
+      "[Auditable]\n[AuditTable(ProductHistory)]\nmodel Product {\n  id Int @id\n}\n",
+    );
+
+    const product = metadata.models[0];
+    assert.equal(product?.auditModelName, "ProductHistory");
+    assert.equal(product?.auditTableName, "product_history");
+    assert.equal(product?.auditDelegate, "productHistory");
+    // The source model is untouched.
+    assert.equal(product?.delegate, "product");
+  });
+
+  it("renames only the table when [AuditTable] is given a quoted name", () => {
+    const { metadata } = parseSchemaText(
+      '[AuditTable("product_hist")]\n[Auditable]\nmodel Product {\n  id Int @id\n}\n',
+    );
+
+    const product = metadata.models[0];
+    assert.equal(product?.auditModelName, "ProductAud");
+    assert.equal(product?.auditTableName, "product_hist");
+  });
+
+  it("rejects [AuditTable] on a model that is not [Auditable]", () => {
+    assert.throws(
+      () => parseSchemaText("[AuditTable(H)]\nmodel Product {\n  id Int @id\n}\n"),
+      /does nothing without \[Auditable\]/,
+    );
+  });
+
+  it("rejects [AuditTable] without a name", () => {
+    assert.throws(
+      () =>
+        parseSchemaText("[Auditable]\n[AuditTable]\nmodel Product {\n  id Int @id\n}\n"),
+      /needs a name/,
+    );
+  });
+
+  it("rejects an audit name the schema already declares", () => {
+    assert.throws(
+      () =>
+        parseSchemaText(
+          "[Auditable]\n[AuditTable(Archive)]\nmodel Product {\n  id Int @id\n}\nmodel Archive {\n  id Int @id\n}\n",
+        ),
+      /already declares on line 6/,
+    );
+  });
+
+  it("rejects two models that would share one audit table", () => {
+    assert.throws(
+      () =>
+        parseSchemaText(
+          '[Auditable]\n[AuditTable("history")]\nmodel A {\n  id Int @id\n}\n[Auditable]\n[AuditTable("history")]\nmodel B {\n  id Int @id\n}\n',
+        ),
+      /would both use the audit table history/,
+    );
+  });
+
+  it("rejects a model that collides with the generated Revision", () => {
+    assert.throws(
+      () => parseSchemaText("model Revision {\n  id Int @id\n}\n"),
+      /collides with the model prisma-audit generates/,
+    );
+  });
+
+  it("rejects an enum that collides with the generated RevisionType", () => {
+    assert.throws(
+      () => parseSchemaText("enum RevisionType {\n  A\n}\n"),
+      /collides with the enum prisma-audit generates/,
+    );
+  });
+
+  it("rejects [NotAudited] written above a model", () => {
+    assert.throws(
+      () => parseSchemaText("[NotAudited]\nmodel A {\n  id Int @id\n}\n"),
+      /can only be placed on a field/,
+    );
+  });
+
+  it("rejects [Auditable] written above a field", () => {
+    assert.throws(
+      () => parseSchemaText("model A {\n  [Auditable]\n  id Int @id\n}\n"),
+      /can only be placed on a model/,
+    );
+  });
+
   it("rejects an auditable model without a primary key", () => {
     assert.throws(
       () => parseSchemaText("[Auditable]\nmodel A {\n  name String\n}\n"),

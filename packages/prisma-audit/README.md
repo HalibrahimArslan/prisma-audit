@@ -60,7 +60,7 @@ it carries annotations Prisma does not understand. `prisma-audit generate`
 preprocesses it:
 
 ```
-prisma/schema.prisma            you edit this: [Auditable], [NotAudited]
+prisma/schema.prisma            you edit this: [Auditable], [NotAudited], [AuditTable]
         │
         ▼
    prisma-audit generate
@@ -114,7 +114,7 @@ roadmap; the extension is a convenience layer, not a security boundary.
 
 ```
 packages/prisma-audit/     the published package
-  src/parser/              [Auditable] / [NotAudited] -> AuditMetadata
+  src/parser/              [Auditable] / [NotAudited] / [AuditTable] -> AuditMetadata
   src/generator/           AuditMetadata -> audit.prisma
   src/runtime/             withAudit, $auditTransaction, the query extension
   src/reader/              AuditReader / AuditQuery
@@ -231,6 +231,40 @@ between the read and the write would be changed without an audit row. Raise the
 isolation level if that matters.
 
 ---
+
+## Annotations
+
+Three of them, written in square brackets above the declaration they apply to.
+`prisma-audit generate` strips them out, so `schema.prisma` stays a file you own
+and Prisma never sees the annotations.
+
+| annotation          | on                       | effect                                   |
+| ------------------- | ------------------------ | ---------------------------------------- |
+| `[Auditable]`       | a model                  | the model gets an audit table            |
+| `[NotAudited]`      | a field                  | the field is left out of the audit table |
+| `[AuditTable(...)]` | an `[Auditable]` model   | names that audit table                   |
+
+By default the history of `Product` is the model `ProductAud`, mapped to the
+table `product_aud`. `[AuditTable]` overrides that, in either of two ways:
+
+```prisma
+[Auditable]
+[AuditTable(ProductHistory)]    // model ProductHistory, table product_history
+model Product { … }
+
+[Auditable]
+[AuditTable("stock_history")]   // model StockAud, table stock_history
+model Stock { … }
+```
+
+An identifier names the generated model and the table name follows from it; a
+quoted string names the table alone, which is what an existing history table
+needs. Neither changes how the history is read — the reader is asked for
+`"Product"`, the model as your schema names it.
+
+Generated names are checked while parsing: one that collides with a model the
+schema already declares, with another model's audit table, or with the
+`Revision` model prisma-audit generates itself, is an error naming both sides.
 
 ## Composite primary keys
 

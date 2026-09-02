@@ -139,6 +139,26 @@ model OrderLine {
     assert.match(audit, /quantity\s+Int\?/);
   });
 
+  it("follows [AuditTable] for the model, the table and the back-relation", () => {
+    const { metadata: renamed } = parseSchemaText(
+      `[Auditable]
+[AuditTable(ProductHistory)]
+model Product {
+  id   Int    @id
+  name String
+}
+`,
+    );
+
+    const out = generateAuditSchema(renamed);
+
+    assert.match(out, /model ProductHistory \{/);
+    assert.match(block(out, "ProductHistory"), /@@map\("product_history"\)/);
+    // Prisma needs the back-relation to name the renamed model.
+    assert.match(block(out, "Revision"), /productHistory ProductHistory\[\]/);
+    assert.ok(!/ProductAud/.test(out));
+  });
+
   it("produces nothing but the revision scaffolding when no model is annotated", () => {
     const { metadata: empty } = parseSchemaText("model A {\n  id Int @id\n}\n");
     const emptyOutput = generateAuditSchema(empty);

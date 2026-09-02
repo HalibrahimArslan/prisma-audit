@@ -47,6 +47,8 @@ const PROVIDER = /^\s*provider\s*=\s*"([^"]+)"/;
 /** `@@id([orderId, lineNo], name: "orderLine")`, with the argument list captured. */
 const BLOCK_ID = /^\s*@@id\s*\(\s*\[([^\]]*)\]\s*(?:,([^)]*))?\)/;
 const KEY_NAME = /\bname\s*:\s*"([^"]+)"/;
+/** A Prisma model name, as `[AuditTable(...)]` may supply one. */
+const IDENTIFIER = /^[A-Za-z][A-Za-z0-9_]*$/;
 
 /** Field names the generator reserves on every audit model. */
 export const RESERVED_AUDIT_FIELDS = ["revisionId", "revision", "revType"];
@@ -58,20 +60,27 @@ export function parseSchemaText(source: string): ParseResult {
   const enums: string[] = [];
   const warnings: string[] = [];
 
-  /** The annotation seen on the previous line, waiting for its declaration. */
-  let pending: { name: string; line: number } | null = null;
+  /**
+   * Annotations seen since the last declaration, waiting for the one they
+   * belong to. A model can carry more than one, e.g. `[Auditable]` above
+   * `[AuditTable(ProductHistory)]`.
+   */
+  let pending: PendingAnnotation[] = [];
   let currentModel: AuditModel | null = null;
   let currentBlock: string | null = null;
   /** The `datasource` provider, which decides some runtime strategies. */
   let provider: string | undefined;
   /** Where each model's `@@id([...])` sits, so key errors can point at it. */
   const keyLines = new Map<string, number>();
+  /** Where each `enum` is declared, for the same reason. */
+  const enumLines = new Map<string, number>();
 
   const failPending = () => {
-    if (pending) {
+    const orphan = pending[0];
+    if (orphan) {
       throw new AuditSchemaError(
-        `[${pending.name}] is not attached to a model or a field`,
-        pending.line,
+        `[${orphan.name}] is not attached to a model or a field`,
+        orphan.line,
       );
     }
   };
@@ -89,8 +98,7 @@ export function parseSchemaText(source: string): ParseResult {
         clean.push("");
         continue;
       }
-      failPending();
-      pending = { name: standalone.name, line: lineNumber };
+      pending.push({ name: standalone.name, argument: standalone.argument, line: lineNumber });
       // Keep the line count stable so Prisma error positions match the source.
       clean.push("");
       continue;
@@ -99,8 +107,7 @@ export function parseSchemaText(source: string): ParseResult {
     let line = raw;
     const trailing = matchTrailingAnnotation(raw);
     if (trailing) {
-      failPending();
-      pending = { name: trailing.name, line: lineNumber };
+      pending.push({ name: trailing.name, argument: trailing.argument, line: lineNumber });
       line = trailing.rest;
     }
 
@@ -109,13 +116,15 @@ export function parseSchemaText(source: string): ParseResult {
       const kind = blockStart[1] as string;
       const name = blockStart[2] as string;
 
-      if (kind === "enum") enums.push(name);
+      if (kind === "enum") {
+        enums.push(name);
+        enumLines.set(name, lineNumber);
+      }
 
       if (kind === "model") {
-        const auditable = pending?.name === ANNOTATIONS.auditable;
         currentModel = {
           name,
-          auditable,
+          auditable: false,
           auditModelName: `${name}Aud`,
           auditTableName: `${toSnakeCase(name)}_aud`,
           delegate: toDelegateName(name),
@@ -124,16 +133,20 @@ export function parseSchemaText(source: string): ParseResult {
           fields: [],
           line: lineNumber,
         };
+        applyModelAnnotations(currentModel, pending);
         models.push(currentModel);
-      } else if (pending) {
-        throw new AuditSchemaError(
-          `[${pending.name}] can only be placed on a model or a field, not on ${kind} ${name}`,
-          pending.line,
-        );
+      } else {
+        const first = pending[0];
+        if (first) {
+          throw new AuditSchemaError(
+            `[${first.name}] can only be placed on a model or a field, not on ${kind} ${name}`,
+            first.line,
+          );
+        }
       }
 
       currentBlock = kind;
-      pending = null;
+      pending = [];
       clean.push(line);
       continue;
     }
@@ -148,15 +161,18 @@ export function parseSchemaText(source: string): ParseResult {
 
     if (currentBlock === "model" && currentModel) {
       parseModelLine(currentModel, line, lineNumber, pending, keyLines);
-      pending = null;
+      pending = [];
     } else if (currentBlock === "datasource") {
       const match = PROVIDER.exec(line);
       if (match) provider = match[1] as string;
-    } else if (pending) {
-      throw new AuditSchemaError(
-        `[${pending.name}] must be followed by a model or a field declaration`,
-        pending.line,
-      );
+    } else {
+      const first = pending[0];
+      if (first) {
+        throw new AuditSchemaError(
+          `[${first.name}] must be followed by a model or a field declaration`,
+          first.line,
+        );
+      }
     }
 
     clean.push(line);
@@ -167,6 +183,7 @@ export function parseSchemaText(source: string): ParseResult {
   const metadata: AuditMetadata = { version: METADATA_VERSION, models, enums };
   if (provider) metadata.provider = provider;
   resolveFieldKinds(metadata);
+  validateNames(metadata, enumLines);
   validate(metadata, keyLines);
 
   return { cleanSchema: clean.join("\n"), metadata, warnings };
@@ -176,17 +193,18 @@ function parseModelLine(
   model: AuditModel,
   line: string,
   lineNumber: number,
-  pending: { name: string; line: number } | null,
+  pending: PendingAnnotation[],
   keyLines: Map<string, number>,
 ): void {
   const trimmed = line.trim();
+  const orphan = pending[0];
 
   // Comments, block attributes and blank lines carry no field information.
   if (trimmed === "" || trimmed.startsWith("//") || trimmed.startsWith("@@")) {
-    if (pending) {
+    if (orphan) {
       throw new AuditSchemaError(
-        `[${pending.name}] must be directly above a field declaration`,
-        pending.line,
+        `[${orphan.name}] must be directly above a field declaration`,
+        orphan.line,
       );
     }
     const blockId = BLOCK_ID.exec(trimmed);
@@ -205,10 +223,10 @@ function parseModelLine(
 
   const match = FIELD.exec(line);
   if (!match) {
-    if (pending) {
+    if (orphan) {
       throw new AuditSchemaError(
-        `[${pending.name}] must be directly above a field declaration`,
-        pending.line,
+        `[${orphan.name}] must be directly above a field declaration`,
+        orphan.line,
       );
     }
     return;
@@ -220,7 +238,7 @@ function parseModelLine(
   const isOptional = Boolean(match[4]);
   const attributes = (match[5] ?? "").trim();
 
-  const excludedByAnnotation = pending?.name === ANNOTATIONS.notAudited;
+  const excludedByAnnotation = fieldIsExcluded(model, pending);
   const isId = /(^|\s)@id(\s|\(|$)/.test(attributes);
 
   const field: AuditField = {
@@ -242,6 +260,110 @@ function parseModelLine(
   if (isId && !keyLines.has(model.name)) model.primaryKey = [name];
 
   model.fields.push(field);
+}
+
+/** One `[Annotation]` waiting for the declaration it belongs to. */
+interface PendingAnnotation {
+  name: string;
+  argument?: string;
+  line: number;
+}
+
+/**
+ * Apply the annotations written above a `model` declaration.
+ *
+ * `[Auditable]` and `[AuditTable(...)]` stack, in either order, and each may be
+ * written only once.
+ */
+function applyModelAnnotations(model: AuditModel, pending: PendingAnnotation[]): void {
+  let naming: PendingAnnotation | undefined;
+
+  for (const annotation of pending) {
+    if (annotation.name === ANNOTATIONS.notAudited) {
+      throw new AuditSchemaError(
+        `[${ANNOTATIONS.notAudited}] can only be placed on a field, not on model ${model.name}`,
+        annotation.line,
+      );
+    }
+
+    if (annotation.name === ANNOTATIONS.auditable) {
+      if (model.auditable) {
+        throw new AuditSchemaError(
+          `Model ${model.name} carries [${ANNOTATIONS.auditable}] more than once`,
+          annotation.line,
+        );
+      }
+      model.auditable = true;
+      continue;
+    }
+
+    if (naming) {
+      throw new AuditSchemaError(
+        `Model ${model.name} carries [${ANNOTATIONS.auditTable}] more than once`,
+        annotation.line,
+      );
+    }
+    naming = annotation;
+  }
+
+  if (naming) applyAuditTableName(model, naming);
+}
+
+/**
+ * `[AuditTable(ProductHistory)]` renames the generated model, and the table
+ * follows from it; `[AuditTable("product_history")]` renames the table alone,
+ * which is what an existing history table needs.
+ */
+function applyAuditTableName(model: AuditModel, annotation: PendingAnnotation): void {
+  if (!model.auditable) {
+    throw new AuditSchemaError(
+      `[${ANNOTATIONS.auditTable}] on model ${model.name} does nothing without [${ANNOTATIONS.auditable}]`,
+      annotation.line,
+    );
+  }
+
+  const argument = annotation.argument;
+
+  if (!argument) {
+    throw new AuditSchemaError(
+      `[${ANNOTATIONS.auditTable}] needs a name: [${ANNOTATIONS.auditTable}(${model.name}History)] for the model, or [${ANNOTATIONS.auditTable}("${toSnakeCase(model.name)}_history")] for the table`,
+      annotation.line,
+    );
+  }
+
+  const quoted = /^"([^"]+)"$/.exec(argument);
+  if (quoted) {
+    model.auditTableName = quoted[1] as string;
+    return;
+  }
+
+  if (!IDENTIFIER.test(argument)) {
+    throw new AuditSchemaError(
+      `[${ANNOTATIONS.auditTable}(${argument})] is neither a model name nor a quoted table name`,
+      annotation.line,
+    );
+  }
+
+  model.auditModelName = argument;
+  model.auditTableName = toSnakeCase(argument);
+  model.auditDelegate = toDelegateName(argument);
+}
+
+/** Apply the annotations written above a field, and say whether it is excluded. */
+function fieldIsExcluded(model: AuditModel, pending: PendingAnnotation[]): boolean {
+  let excluded = false;
+
+  for (const annotation of pending) {
+    if (annotation.name !== ANNOTATIONS.notAudited) {
+      throw new AuditSchemaError(
+        `[${annotation.name}] can only be placed on a model, not on a field of ${model.name}`,
+        annotation.line,
+      );
+    }
+    excluded = true;
+  }
+
+  return excluded;
 }
 
 /**
@@ -284,6 +406,73 @@ function resolveFieldKinds(metadata: AuditMetadata): void {
         field.audited = false;
         field.excludedBy = "list";
       }
+    }
+  }
+}
+
+/** Names the generator always emits, whatever the schema declares. */
+const GENERATED_NAMES = new Map([
+  ["Revision", "model"],
+  ["RevisionType", "enum"],
+]);
+
+/**
+ * Every generated name has to be free.
+ *
+ * Prisma keeps models and enums in one namespace, so a clash produces a schema
+ * Prisma rejects with an error pointing into the generated file rather than the
+ * one the developer edits. `[AuditTable(...)]` makes a clash easy to write by
+ * hand, and a source model called `Revision` was always going to hit one.
+ */
+function validateNames(metadata: AuditMetadata, enumLines: Map<string, number>): void {
+  const declared = new Map<string, number>();
+
+  for (const model of metadata.models) declared.set(model.name, model.line);
+  for (const [name, line] of enumLines) declared.set(name, line);
+
+  for (const [name, line] of declared) {
+    const kind = GENERATED_NAMES.get(name);
+    if (kind) {
+      throw new AuditSchemaError(
+        `${name} collides with the ${kind} prisma-audit generates. Rename it`,
+        line,
+      );
+    }
+  }
+
+  /** Audit names already taken, and the model that took them. */
+  const taken = new Map<string, string>();
+
+  for (const model of metadata.models) {
+    if (!model.auditable) continue;
+
+    if (GENERATED_NAMES.has(model.auditModelName)) {
+      throw new AuditSchemaError(
+        `The audit model of ${model.name} cannot be called ${model.auditModelName}: prisma-audit generates that name itself`,
+        model.line,
+      );
+    }
+
+    const clash = declared.get(model.auditModelName);
+    if (clash !== undefined) {
+      throw new AuditSchemaError(
+        `The audit model of ${model.name} would be called ${model.auditModelName}, which the schema already declares on line ${clash}. Rename it with [${ANNOTATIONS.auditTable}(...)]`,
+        model.line,
+      );
+    }
+
+    for (const [name, kind] of [
+      [model.auditModelName, "audit model"],
+      [model.auditTableName, "audit table"],
+    ] as const) {
+      const owner = taken.get(`${kind}:${name}`);
+      if (owner) {
+        throw new AuditSchemaError(
+          `${model.name} and ${owner} would both use the ${kind} ${name}`,
+          model.line,
+        );
+      }
+      taken.set(`${kind}:${name}`, model.name);
     }
   }
 }
