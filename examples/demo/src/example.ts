@@ -63,6 +63,46 @@ async function main(): Promise<void> {
   await bulk(category.id);
   await composite();
   await nested(category.id);
+  await aggregate();
+}
+
+/**
+ * An aggregate: the order and the lines that belong to it. Nothing extra is
+ * stored for this — a line's audit row already carries the order it pointed at,
+ * so the order can be reconstructed with its lines as of any revision.
+ */
+async function aggregate(): Promise<void> {
+  await prisma.$auditTransaction(ahmet, async (tx) => {
+    await tx.order.update({ where: { id: 1 }, data: { status: "shipped" } });
+  });
+
+  const order = prisma.audit.for("Order").id(1).aggregate();
+
+  console.log("\n── Aggregate: every revision that touched order 1 ──────────");
+  for (const revision of await order.getRevisions()) {
+    const changes = revision.changes
+      .map((change) => `${change.model}#${formatKey(change.id)} ${change.revType}`)
+      .join(", ");
+    console.log(
+      `  rev ${String(revision.revisionId).padStart(3)}  ${revision.user.username ?? "-"}  ${changes}`,
+    );
+  }
+
+  const revisions = await order.getRevisions();
+  const first = revisions[0]?.revisionId;
+  const last = revisions.at(-1)?.revisionId;
+
+  for (const revisionId of [first, last]) {
+    if (revisionId === undefined) continue;
+
+    const at = await order.atRevision(revisionId);
+    const entity = at?.entity as Record<string, unknown>;
+    const lines = (at?.children.lines ?? [])
+      .map((line) => `line ${String(line.lineNo)} x${String(line.quantity)}`)
+      .join(", ");
+
+    console.log(`\n  order 1 at rev ${revisionId}: ${String(entity.status)}  [${lines}]`);
+  }
 }
 
 /**
@@ -191,6 +231,12 @@ async function bulk(categoryId: number): Promise<void> {
  */
 async function composite(): Promise<void> {
   await prisma.$auditTransaction(halil, async (tx) => {
+    await tx.order.createMany({
+      data: [
+        { id: 1, status: "open" },
+        { id: 2, status: "open" },
+      ],
+    });
     await tx.orderLine.createMany({
       data: [
         { orderId: 1, lineNo: 1, quantity: 2 },
@@ -319,7 +365,7 @@ function summarise(entity: unknown): string {
 /** Start from a clean slate so the demo can be run repeatedly. */
 async function reset(): Promise<void> {
   await prisma.$executeRawUnsafe(
-    'TRUNCATE TABLE "product_aud", "stock_history", "order_line_aud", "revision", "Stock", "Product", "OrderLine", "Category" RESTART IDENTITY CASCADE',
+    'TRUNCATE TABLE "product_aud", "stock_history", "order_line_aud", "order_aud", "revision", "Stock", "Product", "OrderLine", "Order", "Category" RESTART IDENTITY CASCADE',
   );
 }
 

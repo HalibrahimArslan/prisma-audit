@@ -3,15 +3,18 @@
  *
  * Three layers, each usable on its own:
  *
- *   parser + generator  `[Auditable]` / `[NotAudited]` in schema.prisma become
- *                       `Revision` and `*Aud` models.
+ *   parser + generator  `[Auditable]` / `[NotAudited]` / `[AuditTable]` /
+ *                       `[AuditedRelation]` in schema.prisma become `Revision`
+ *                       and `*Aud` models.
  *   runtime             `withAudit()` records create/update/delete, one
  *                       revision per transaction.
  *   reader              `AuditReader` walks the history back.
  */
 
 export {
+  METADATA_VERSION,
   PRISMA_SCALARS,
+  aggregateRelations,
   auditableModels,
   auditedFields,
   requireAuditableModel,
@@ -19,6 +22,7 @@ export {
   type AuditFieldKind,
   type AuditMetadata,
   type AuditModel,
+  type AuditRelation,
   type PrismaScalar,
 } from "./metadata.js";
 
@@ -59,14 +63,21 @@ export {
 export { AuditReader, type RevisionSummary } from "./reader/audit-reader.js";
 export {
   AuditQuery,
+  toEntity,
   type AuditRevisionEntry,
   type EntityDiff,
   type FieldChange,
   type RevisionType,
 } from "./reader/audit-query.js";
+export {
+  AggregateQuery,
+  type AggregateEntry,
+  type AggregateRevision,
+} from "./reader/aggregate-query.js";
 
 export { loadMetadata } from "./util/load-metadata.js";
 export { toDelegateName, toSnakeCase } from "./util/naming.js";
+export { resolveRelationLink, type JoinColumn, type RelationLink } from "./util/relations.js";
 
 export {
   describeResult,

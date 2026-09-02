@@ -51,6 +51,17 @@ model Stock {
   product   Product @relation(fields: [productId], references: [id])
 }
 
+// An aggregate root: [AuditedRelation] says its lines are part of it, so the
+// order's history can be read together with theirs.
+[Auditable]
+model Order {
+  id     Int    @id @default(autoincrement())
+  status String
+
+  [AuditedRelation]
+  lines OrderLine[]
+}
+
 // A model keyed by two columns. The audit table is keyed the same way, on
 // @@id([revisionId, orderId, lineNo]), and the reader takes the whole key.
 [Auditable]
@@ -59,6 +70,7 @@ model OrderLine {
   lineNo   Int
   quantity Int
   note     String?
+  order    Order   @relation(fields: [orderId], references: [id])
 
   @@id([orderId, lineNo])
 }

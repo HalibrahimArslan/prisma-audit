@@ -60,7 +60,7 @@ it carries annotations Prisma does not understand. `prisma-audit generate`
 preprocesses it:
 
 ```
-prisma/schema.prisma            you edit this: [Auditable], [NotAudited], [AuditTable]
+prisma/schema.prisma            you edit this: [Auditable], [NotAudited], [AuditTable], [AuditedRelation]
         │
         ▼
    prisma-audit generate
@@ -114,7 +114,7 @@ roadmap; the extension is a convenience layer, not a security boundary.
 
 ```
 packages/prisma-audit/     the published package
-  src/parser/              [Auditable] / [NotAudited] / [AuditTable] -> AuditMetadata
+  src/parser/              the [Annotation] vocabulary -> AuditMetadata
   src/generator/           AuditMetadata -> audit.prisma
   src/runtime/             withAudit, $auditTransaction, the query extension
   src/reader/              AuditReader / AuditQuery
@@ -234,15 +234,16 @@ isolation level if that matters.
 
 ## Annotations
 
-Three of them, written in square brackets above the declaration they apply to.
+Four of them, written in square brackets above the declaration they apply to.
 `prisma-audit generate` strips them out, so `schema.prisma` stays a file you own
 and Prisma never sees the annotations.
 
-| annotation          | on                       | effect                                   |
-| ------------------- | ------------------------ | ---------------------------------------- |
-| `[Auditable]`       | a model                  | the model gets an audit table            |
-| `[NotAudited]`      | a field                  | the field is left out of the audit table |
-| `[AuditTable(...)]` | an `[Auditable]` model   | names that audit table                   |
+| annotation           | on                     | effect                                        |
+| -------------------- | ---------------------- | --------------------------------------------- |
+| `[Auditable]`        | a model                | the model gets an audit table                 |
+| `[NotAudited]`       | a field                | the field is left out of the audit table      |
+| `[AuditTable(...)]`  | an `[Auditable]` model | names that audit table                        |
+| `[AuditedRelation]`  | a relation field       | its rows are part of this model's aggregate   |
 
 By default the history of `Product` is the model `ProductAud`, mapped to the
 table `product_aud`. `[AuditTable]` overrides that, in either of two ways:

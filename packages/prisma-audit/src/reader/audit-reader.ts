@@ -35,7 +35,7 @@ export class AuditReader {
   /** Start a history query for an audited model. */
   for<T = Record<string, unknown>>(modelName: string): AuditQuery<T> {
     const model = requireAuditableModel(this.metadata, modelName);
-    return new AuditQuery<T>(this.client, model);
+    return new AuditQuery<T>(this.client, this.metadata, model);
   }
 
   /** Envers-shaped entry point: `createQuery().forEntity("Product")`. */

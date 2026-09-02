@@ -63,6 +63,12 @@ export interface AuditField {
   excludedBy?: "annotation" | "relation" | "list";
   /** How the relation is joined. Only present when `kind` is `"relation"`. */
   relation?: AuditRelation;
+  /**
+   * `true` when the field carries `[AuditedRelation]`: the rows it points at
+   * belong to this model's aggregate, and the reader can reconstruct them
+   * alongside it.
+   */
+  aggregate?: boolean;
   /** 1-based line in the source schema, used for error messages. */
   line: number;
 }
@@ -97,15 +103,16 @@ export interface AuditModel {
 }
 
 /** The metadata format this build of prisma-audit writes and reads. */
-export const METADATA_VERSION = 3;
+export const METADATA_VERSION = 4;
 
 export interface AuditMetadata {
   /**
    * Metadata format version, bumped when the shape changes. Version 2 turned
    * `AuditModel.primaryKey` from a single column name into the list of columns
    * that form the key; version 3 added `AuditField.relation`, which is what
-   * lets a nested write be followed to the rows it reaches. `loadMetadata`
-   * upgrades an older file in memory as far as it can.
+   * lets a nested write be followed to the rows it reaches; version 4 added
+   * `AuditField.aggregate`. `loadMetadata` upgrades an older file in memory as
+   * far as it can.
    */
   version: number;
   /** Every model found in the schema, audited or not. */
@@ -123,6 +130,11 @@ export interface AuditMetadata {
 /** The audited fields of a model, in schema order. */
 export function auditedFields(model: AuditModel): AuditField[] {
   return model.fields.filter((field) => field.audited);
+}
+
+/** The relations declared `[AuditedRelation]`, i.e. this model's aggregate. */
+export function aggregateRelations(model: AuditModel): AuditField[] {
+  return model.fields.filter((field) => field.aggregate);
 }
 
 /** Only the models that carry `[Auditable]`. */

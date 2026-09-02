@@ -25,6 +25,11 @@ export const ANNOTATIONS = {
    * table from it; `[AuditTable("product_history")]` names the table alone.
    */
   auditTable: "AuditTable",
+  /**
+   * Placed above a relation field: the rows on the other side are part of this
+   * model's aggregate, so its history can be read together with theirs.
+   */
+  auditedRelation: "AuditedRelation",
 } as const;
 
 export type AnnotationName = (typeof ANNOTATIONS)[keyof typeof ANNOTATIONS];

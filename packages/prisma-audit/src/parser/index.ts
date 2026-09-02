@@ -10,6 +10,7 @@ import {
   type AuditModel,
 } from "../metadata.js";
 import { splitAttributes } from "../util/attributes.js";
+import { resolveRelationLink } from "../util/relations.js";
 import { toDelegateName, toSnakeCase } from "../util/naming.js";
 import {
   ANNOTATIONS,
@@ -240,7 +241,8 @@ function parseModelLine(
   const isOptional = Boolean(match[4]);
   const attributes = (match[5] ?? "").trim();
 
-  const excludedByAnnotation = fieldIsExcluded(model, pending);
+  const annotations = applyFieldAnnotations(model, pending);
+  const excludedByAnnotation = annotations.excluded;
   const isId = /(^|\s)@id(\s|\(|$)/.test(attributes);
 
   const field: AuditField = {
@@ -256,6 +258,7 @@ function parseModelLine(
   };
 
   if (excludedByAnnotation) field.excludedBy = "annotation";
+  if (annotations.aggregate) field.aggregate = true;
 
   // A field-level `@id` only counts while no `@@id([...])` has been seen; the
   // block attribute may also come after the fields it names.
@@ -385,21 +388,34 @@ function applyAuditTableName(model: AuditModel, annotation: PendingAnnotation): 
   model.auditDelegate = toDelegateName(argument);
 }
 
-/** Apply the annotations written above a field, and say whether it is excluded. */
-function fieldIsExcluded(model: AuditModel, pending: PendingAnnotation[]): boolean {
-  let excluded = false;
+/** Apply the annotations written above a field. */
+function applyFieldAnnotations(
+  model: AuditModel,
+  pending: PendingAnnotation[],
+): { excluded: boolean; aggregate: boolean } {
+  const applied = { excluded: false, aggregate: false };
 
   for (const annotation of pending) {
-    if (annotation.name !== ANNOTATIONS.notAudited) {
+    if (annotation.name === ANNOTATIONS.notAudited) {
+      applied.excluded = true;
+    } else if (annotation.name === ANNOTATIONS.auditedRelation) {
+      applied.aggregate = true;
+    } else {
       throw new AuditSchemaError(
         `[${annotation.name}] can only be placed on a model, not on a field of ${model.name}`,
         annotation.line,
       );
     }
-    excluded = true;
   }
 
-  return excluded;
+  if (applied.excluded && applied.aggregate) {
+    throw new AuditSchemaError(
+      `A field of ${model.name} cannot be both [${ANNOTATIONS.notAudited}] and [${ANNOTATIONS.auditedRelation}]`,
+      (pending[0] as PendingAnnotation).line,
+    );
+  }
+
+  return applied;
 }
 
 /**
@@ -536,6 +552,10 @@ function validate(metadata: AuditMetadata, keyLines: Map<string, number>): void 
     }
 
     for (const field of model.fields) {
+      if (field.aggregate) validateAggregateRelation(metadata, model, field);
+    }
+
+    for (const field of model.fields) {
       if (field.audited && RESERVED_AUDIT_FIELDS.includes(field.name)) {
         throw new AuditSchemaError(
           `${model.name}.${field.name} collides with a column prisma-audit adds to every audit table (${RESERVED_AUDIT_FIELDS.join(", ")}). Rename it or mark it [NotAudited]`,
@@ -543,6 +563,61 @@ function validate(metadata: AuditMetadata, keyLines: Map<string, number>): void 
         );
       }
     }
+  }
+}
+
+/**
+ * An aggregate relation has to be one the reader can actually walk: to a model
+ * that is audited, and joined by columns the schema names, with the rows on the
+ * other side pointing back at this one.
+ */
+function validateAggregateRelation(
+  metadata: AuditMetadata,
+  model: AuditModel,
+  field: AuditField,
+): void {
+  const annotation = `[${ANNOTATIONS.auditedRelation}]`;
+
+  if (field.kind !== "relation") {
+    throw new AuditSchemaError(
+      `${annotation} belongs on a relation field, and ${model.name}.${field.name} is not one`,
+      field.line,
+    );
+  }
+
+  const target = metadata.models.find((candidate) => candidate.name === field.type);
+
+  if (!target?.auditable) {
+    throw new AuditSchemaError(
+      `${model.name}.${field.name} is ${annotation}, so ${field.type} has to be [${ANNOTATIONS.auditable}] too`,
+      field.line,
+    );
+  }
+
+  const link = resolveRelationLink(field, model, target);
+
+  if (!link) {
+    throw new AuditSchemaError(
+      `${model.name}.${field.name} is ${annotation}, but the schema does not name the columns that join it — an implicit many-to-many, or two relations that need a @relation("name") to tell them apart`,
+      field.line,
+    );
+  }
+
+  for (const column of link.columns) {
+    const key = target.fields.find((candidate) => candidate.name === column.child);
+    if (key && !key.audited) {
+      throw new AuditSchemaError(
+        `${model.name}.${field.name} is ${annotation}, so ${target.name}.${column.child} cannot be [${ANNOTATIONS.notAudited}]: the audit table joins on it`,
+        key.line,
+      );
+    }
+  }
+
+  if (link.kind !== "child-owns") {
+    throw new AuditSchemaError(
+      `${model.name}.${field.name} is ${annotation}, but ${model.name} holds the foreign key: the aggregate root is the side the other model points at, so put ${annotation} on ${target.name}'s side`,
+      field.line,
+    );
   }
 }
 

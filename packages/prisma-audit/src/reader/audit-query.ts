@@ -1,6 +1,7 @@
-import { auditedFields, type AuditModel } from "../metadata.js";
+import { auditedFields, type AuditMetadata, type AuditModel } from "../metadata.js";
 import { isComposite, keyOf, type EntityKey } from "../util/keys.js";
 import { sameValue } from "../util/values.js";
+import { AggregateQuery } from "./aggregate-query.js";
 
 export type RevisionType = "INSERT" | "UPDATE" | "DELETE";
 
@@ -37,6 +38,7 @@ export class AuditQuery<T = Record<string, unknown>> {
 
   constructor(
     private readonly client: AnyClient,
+    private readonly metadata: AuditMetadata,
     private readonly model: AuditModel,
   ) {}
 
@@ -51,6 +53,23 @@ export class AuditQuery<T = Record<string, unknown>> {
   id(value: unknown): this {
     this.key = this.toKey(value);
     return this;
+  }
+
+  /**
+   * Read this row together with the rows that belong to it: the relations
+   * marked `[AuditedRelation]`, or the ones named here.
+   *
+   *     await prisma.audit.for("Order").id(1).aggregate().atRevision(120n);
+   */
+  aggregate(...relations: string[]): AggregateQuery<T> {
+    return new AggregateQuery<T>(
+      this.client,
+      this.metadata,
+      this.model,
+      this.whereId(),
+      (revisionId) => this.atRevision(revisionId),
+      relations,
+    );
   }
 
   /** Every recorded revision of the row, oldest first. */
@@ -163,11 +182,7 @@ export class AuditQuery<T = Record<string, unknown>> {
 
   /** Split a raw audit row into revision bookkeeping and entity state. */
   private toEntry(row: any): AuditRevisionEntry<T> {
-    const entity: Record<string, unknown> = {};
-
-    for (const field of auditedFields(this.model)) {
-      entity[field.name] = row[field.name];
-    }
+    const entity = toEntity(this.model, row);
 
     return {
       revisionId: row.revisionId,
@@ -180,4 +195,21 @@ export class AuditQuery<T = Record<string, unknown>> {
       entity: entity as T,
     };
   }
+}
+
+/**
+ * The entity half of an audit row: the columns of the source model, without the
+ * revision bookkeeping the audit table adds alongside them.
+ */
+export function toEntity(
+  model: AuditModel,
+  row: Record<string, unknown>,
+): Record<string, unknown> {
+  const entity: Record<string, unknown> = {};
+
+  for (const field of auditedFields(model)) {
+    entity[field.name] = row[field.name];
+  }
+
+  return entity;
 }

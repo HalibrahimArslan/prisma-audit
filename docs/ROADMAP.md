@@ -1,7 +1,7 @@
 # Roadmap
 
-The plan the project is being built against. Milestones 0–4 are done and verified
-against a real PostgreSQL database; everything from M5 on is open work.
+The plan the project is being built against. Milestones 0–5 are done and verified
+against a real PostgreSQL database; everything from M6 on is open work.
 
 ---
 
@@ -88,7 +88,7 @@ same transaction — the documented cost is that one statement becomes two.
 - Internal re-dispatches carry a bypass flag in the audit context, so a
   statement prisma-audit issues on the client is not audited twice.
 
-## M5 — Schema coverage
+## M5 — Schema coverage ✅
 
 - ✅ Composite primary keys. A model's key is a vector of columns rather than a
   scalar throughout: the parser reads `@@id([a, b])` (and the `name:` Prisma
@@ -113,7 +113,17 @@ same transaction — the documented cost is that one statement becomes two.
   makes the rows findable; an implicit many-to-many names no join columns and
   still warns, as does an ambiguous pair of relations. Verified against
   PostgreSQL by the demo.
-- Relation auditing strategies, e.g. auditing an aggregate together with its children.
+- ✅ Relation auditing strategies. `[AuditedRelation]` on a relation declares
+  that its rows are part of the model's aggregate, and
+  `audit.for("Order").id(1).aggregate()` reads the root together with them:
+  `atRevision` reconstructs the children as they stood then, `getRevisions`
+  lists every revision that changed the root or a child. Nothing extra is
+  stored — a child's audit row already carries the foreign key, so the
+  reconstruction is a read of the latest state per child at or before the
+  revision, keeping the ones that still belonged to that root. A child moved to
+  another root stops belonging from the revision that moved it. The root is the
+  side the children point at, and putting the annotation on the other side is a
+  parse error that says so.
 - ✅ Configurable audit table naming. `[AuditTable(ProductHistory)]` names the
   generated model and derives the table from it; `[AuditTable("product_history")]`
   names the table alone, for an audit table that already exists. Annotations now
