@@ -99,9 +99,20 @@ same transaction — the documented cost is that one statement becomes two.
   change. There is no `IN (...)` form for a multi-column key, so bulk reads
   list the keys as alternatives and are chunked by key width. Verified against
   PostgreSQL by the demo.
-- Nested writes: `product.update({ data: { orderLines: { create: … } } })`
-  currently audits only the top-level model. The gap is at least loud now — a
-  nested write that reaches an `[Auditable]` model warns once per relation.
+- ✅ Nested writes. `product.update({ data: { stock: { update: … } } })` records
+  the rows it reaches as well as the top-level one. The statement itself is left
+  exactly as the caller wrote it: instead of taking the payload apart and
+  re-issuing it, the rows in reach — those already related to the parent, plus
+  those the payload names by key — are read before and after it, and the
+  difference becomes audit rows. Naming the keys is what tells a connected row
+  from a created one, and a disconnected one from a deleted one; a row in reach
+  that did not actually change records nothing. A write on a model that is not
+  itself audited is followed too, since it can still reach one that is. The cost
+  is two reads per nested relation, paid only when a nested payload is present.
+  The parser now reads `@relation(fields:, references:, name:)`, which is what
+  makes the rows findable; an implicit many-to-many names no join columns and
+  still warns, as does an ambiguous pair of relations. Verified against
+  PostgreSQL by the demo.
 - Relation auditing strategies, e.g. auditing an aggregate together with its children.
 - ✅ Configurable audit table naming. `[AuditTable(ProductHistory)]` names the
   generated model and derives the table from it; `[AuditTable("product_history")]`
@@ -128,9 +139,10 @@ The extension only sees what goes through Prisma. A raw `UPDATE` leaves no trace
   `@prisma/client` absent.
 - MySQL and SQLite verification; the generator is portable but untested there.
 - ✅ Upgrade path for `audit.metadata.json`: the file is versioned, and
-  `loadMetadata` upgrades an older one in memory rather than refusing to start.
-  Version 1 → 2, which widened `primaryKey` to a list of columns, is the first
-  such step.
+  `loadMetadata` upgrades an older one in memory rather than refusing to start —
+  deriving what it can, leaving absent what it cannot, and failing only on a
+  file newer than the build reading it. Version 1 → 2 widened `primaryKey` to a
+  list of columns; 2 → 3 added how relations join.
 - Publish `prisma-audit` to npm.
 
 ---

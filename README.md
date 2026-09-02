@@ -175,7 +175,7 @@ export const prisma = withAudit(new PrismaClient({ adapter }), {
   metadata: loadMetadata("prisma/.audit/audit.metadata.json"),
   userProvider: () => currentRequestUser(),   // optional
   onMissingRevision: "transaction",           // "transaction" | "skip" | "error"
-  onNestedWrite: (model, relation, target) => {},  // optional, replaces the warning
+  onNestedWrite: (model, relation, target) => {},  // optional, see Nested writes
 });
 ```
 
@@ -321,14 +321,55 @@ for a multi-column key, so the rows are read back as a list of alternatives
 
 ---
 
+## Nested writes
+
+A write can reach a second model inside a single Prisma call:
+
+```ts
+await prisma.product.update({
+  where: { id: 1 },
+  data: {
+    price: 58_000,
+    stock: { update: { quantity: 2 } },   // a different model, same statement
+  },
+});
+```
+
+Prisma resolves the whole payload itself, so no separate operation reaches the
+extension for the `Stock` row. Rather than take the payload apart and re-issue
+it — which would mean prisma-audit rewriting your query, and guessing at foreign
+keys, `connectOrCreate` and implicit many-to-many — the statement is left
+exactly as written and the rows it can reach are read before and after it:
+
+| after the write | recorded |
+| --------------- | -------- |
+| a key that was not in reach before | `INSERT` |
+| a key on both sides, with a changed column | `UPDATE` |
+| a key that is gone | `DELETE` |
+| a key on both sides, unchanged | nothing |
+
+"In reach" is every row already related to the parent, plus every row the
+payload names by key — `connect`, `set`, `disconnect`, `update`, `delete`,
+`upsert`. That is what makes a connected row recognisable as the update it is
+rather than an insert, and a disconnected one as an update rather than a delete.
+Everything lands under the parent's revision, so the whole call still reads as
+one event.
+
+The cost is two extra reads per nested relation, paid only by a write that
+carries a nested payload.
+
+Two relations cannot be followed this way, and each warns once instead:
+an implicit many-to-many, where neither side names a join column and neither
+row's own columns change, and two relations between the same models with no
+`@relation("name")` to tell them apart. Pass `onNestedWrite` to `withAudit` to
+handle those yourself instead of warning.
+
 ## Current limitations
 
-Nested writes (`product.update({ data: { stocks: { create: … } } })`) are audited
-only for the top-level model; when the nested model is `[Auditable]`, prisma-audit
-warns once per relation instead of leaving a silent gap. List columns and relation
-fields are excluded from audit tables; the scalar foreign key is kept. A write
-that never goes through Prisma — raw SQL, another service — leaves no trace;
-database triggers are on the roadmap.
+Nested writes are followed one level deep: a payload nested inside a nested
+payload is not. List columns and relation fields are excluded from audit tables;
+the scalar foreign key is kept. A write that never goes through Prisma — raw
+SQL, another service — leaves no trace; database triggers are on the roadmap.
 
 ---
 

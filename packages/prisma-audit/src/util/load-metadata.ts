@@ -27,30 +27,33 @@ export function loadMetadata(metadataPath: string = DEFAULT_PATH): AuditMetadata
 
   const metadata = JSON.parse(raw) as AuditMetadata;
 
-  if (metadata.version === 1) return upgradeFromVersion1(metadata);
-
-  if (metadata.version !== METADATA_VERSION) {
+  if (metadata.version > METADATA_VERSION) {
     throw new Error(
-      `Audit metadata at ${resolved} has version ${String(metadata.version)}, but this ` +
-        `version of prisma-audit expects version ${METADATA_VERSION}. Re-run "prisma-audit generate".`,
+      `Audit metadata at ${resolved} has version ${String(metadata.version)}, which is newer ` +
+        `than the version ${METADATA_VERSION} this build of prisma-audit understands. Upgrade prisma-audit.`,
     );
   }
 
-  return metadata;
+  return metadata.version < METADATA_VERSION ? upgrade(metadata) : metadata;
 }
 
 /**
- * Version 1 recorded a model's primary key as a single column name, because a
- * composite key was rejected at parse time. Version 2 records the columns that
- * make up the key, which reads the same for every schema version 1 accepted.
+ * Bring an older metadata file up to the current shape, in memory.
  *
- * Upgrading in memory means an application keeps starting after a prisma-audit
- * upgrade; the file itself is rewritten by the next `prisma-audit generate`.
+ * An application keeps starting after a prisma-audit upgrade; the file itself is
+ * rewritten by the next `prisma-audit generate`. What can be derived is derived:
+ * version 1 recorded a model's primary key as a single column name, which is a
+ * key of one column. What cannot is left absent — version 2 knows nothing about
+ * how relations join, so a nested write is reported as unauditable until the
+ * metadata is regenerated, which is what it would do for an unfollowable
+ * relation anyway.
  */
-function upgradeFromVersion1(metadata: AuditMetadata): AuditMetadata {
-  for (const model of metadata.models) {
-    const legacy = model.primaryKey as unknown as string | null;
-    model.primaryKey = typeof legacy === "string" ? [legacy] : [];
+function upgrade(metadata: AuditMetadata): AuditMetadata {
+  if (metadata.version < 2) {
+    for (const model of metadata.models) {
+      const legacy = model.primaryKey as unknown as string | null;
+      model.primaryKey = typeof legacy === "string" ? [legacy] : [];
+    }
   }
 
   metadata.version = METADATA_VERSION;

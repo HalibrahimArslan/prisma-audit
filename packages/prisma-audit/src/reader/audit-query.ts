@@ -1,5 +1,6 @@
 import { auditedFields, type AuditModel } from "../metadata.js";
 import { isComposite, keyOf, type EntityKey } from "../util/keys.js";
+import { sameValue } from "../util/values.js";
 
 export type RevisionType = "INSERT" | "UPDATE" | "DELETE";
 
@@ -179,24 +180,4 @@ export class AuditQuery<T = Record<string, unknown>> {
       entity: entity as T,
     };
   }
-}
-
-/**
- * Value equality that is good enough for audit diffs: `Decimal`, `BigInt` and
- * `Date` all compare correctly through their string form, while plain scalars
- * fall back to `Object.is`.
- */
-function sameValue(a: unknown, b: unknown): boolean {
-  if (Object.is(a, b)) return true;
-  if (a === null || b === null) return false;
-
-  if (a instanceof Date && b instanceof Date) {
-    return a.getTime() === b.getTime();
-  }
-
-  if (typeof a === "object" || typeof b === "object") {
-    return String(a) === String(b);
-  }
-
-  return false;
 }

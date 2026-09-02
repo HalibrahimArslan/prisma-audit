@@ -15,6 +15,14 @@ import {
   type EntityKey,
 } from "../util/keys.js";
 import {
+  recordNested,
+  scanNestedWrites,
+  snapshotNested,
+  type NestedGap,
+  type NestedPlan,
+} from "./nested.js";
+import { chunks, readByKeys, CHUNK_SIZE } from "./read.js";
+import {
   getAuditContext,
   runWithAuditContext,
   type AuditContext,
@@ -61,28 +69,6 @@ const REV_TYPE: Record<string, string> = {
   delete: "DELETE",
 };
 
-/** Keys inside a nested relation payload that write rows of the other model. */
-const NESTED_WRITE_KEYS = [
-  "create",
-  "createMany",
-  "connectOrCreate",
-  "update",
-  "updateMany",
-  "upsert",
-  "delete",
-  "deleteMany",
-  "connect",
-  "disconnect",
-  "set",
-];
-
-/**
- * How many rows go into one `IN (...)` read or one audit insert. Databases cap
- * the number of bind parameters per statement, so a bulk write over a very
- * large table has to be read back and recorded in batches.
- */
-const CHUNK_SIZE = 1000;
-
 /** Providers whose `createManyAndReturn` also accepts `skipDuplicates`. */
 const SKIP_DUPLICATES_PROVIDERS = new Set(["postgresql", "postgres", "cockroachdb"]);
 
@@ -113,7 +99,10 @@ export interface AuditOptions {
   provider?: string;
   /**
    * Called once per relation when a write reaches an audited model through a
-   * nested payload, which is not recorded yet. Default: `console.warn`.
+   * nested payload that prisma-audit cannot follow — an implicit many-to-many,
+   * or two relations to one model with no `@relation("name")` to tell them
+   * apart. A nested write it *can* follow is audited, not reported here.
+   * Default: `console.warn`.
    */
   onNestedWrite?: (model: string, relationField: string, targetModel: string) => void;
 }
@@ -139,6 +128,11 @@ interface AuditEntry {
 interface Outcome {
   result: unknown;
   entries: AuditEntry[];
+  /**
+   * The full row a single-row write left behind, which is what says who is
+   * related to it now. Absent for a bulk write, which cannot nest.
+   */
+  parentState?: Record<string, unknown>;
 }
 
 export function buildQueryExtension(box: ClientBox, options: AuditOptions) {
@@ -164,8 +158,8 @@ async function intercept(
 ): Promise<unknown> {
   if (!model) return query(args);
 
-  const auditModel = findAuditable(options.metadata, model);
-  if (!auditModel) return query(args);
+  const source = options.metadata.models.find((candidate) => candidate.name === model);
+  if (!source) return query(args);
 
   const isWrite =
     SINGLE_ROW_OPERATIONS.has(operation) || BULK_OPERATIONS.has(operation);
@@ -177,7 +171,12 @@ async function intercept(
   // operation it is already recording. Auditing it again would duplicate rows.
   if (context.bypass) return query(args);
 
-  warnNestedWrites(options, warned, auditModel, operation, args);
+  const nested = scanNestedWrites(options.metadata, source, operation, args);
+  warnNestedGaps(options, warned, source, operation, nested.gaps);
+
+  // A model that is not itself audited still matters when the write reaches one
+  // that is, e.g. `category.update({ data: { products: { update: … } } })`.
+  if (!source.auditable && nested.plans.length === 0) return query(args);
 
   if (context.revisionId === undefined) {
     const policy = options.onMissingRevision ?? "transaction";
@@ -190,10 +189,10 @@ async function intercept(
       );
     }
 
-    return openRevisionFor(box, options, auditModel, operation, args);
+    return openRevisionFor(box, options, source, operation, args);
   }
 
-  return record(options, auditModel, operation, args, query, context);
+  return record(options, source, operation, args, query, context, nested.plans);
 }
 
 /**
@@ -236,16 +235,56 @@ async function record(
   args: any,
   query: (args: any) => Promise<any>,
   context: AuditContext,
+  plans: NestedPlan[],
 ): Promise<unknown> {
   const client = context.tx as AnyClient;
 
-  const outcome = BULK_OPERATIONS.has(operation)
-    ? await runBulk(options, client, model, operation, args, query)
-    : await runSingleRow(client, model, operation, args, query);
+  // Read the rows the nested payload could touch before the write runs: once it
+  // has, a row it deleted is beyond reach.
+  const snapshots =
+    plans.length > 0 ? await snapshotNested(client, model, operation, args, plans) : [];
+
+  const outcome = !model.auditable
+    ? { result: await query(args), entries: [] }
+    : BULK_OPERATIONS.has(operation)
+      ? await runBulk(options, client, model, operation, args, query)
+      : await runSingleRow(client, model, operation, args, query);
 
   await writeAuditRows(client, model, context, outcome.entries);
 
+  for (const nested of snapshots.length > 0
+    ? await recordNested(client, snapshots, await parentState(client, model, args, outcome))
+    : []) {
+    await writeAuditRows(client, nested.model, context, nested.entries);
+  }
+
   return outcome.result;
+}
+
+/**
+ * The parent row as it stands after the write, which is what says who is
+ * related to it now. An audited write has already resolved that state; an
+ * unaudited one has whatever Prisma returned, re-read when `select` narrowed it.
+ */
+async function parentState(
+  client: AnyClient,
+  model: AuditModel,
+  args: any,
+  outcome: Outcome,
+): Promise<Record<string, unknown>> {
+  if (outcome.parentState) return outcome.parentState;
+
+  const result = (outcome.result ?? {}) as Record<string, unknown>;
+  if (!usesProjection(args)) return result;
+
+  const key = keyOf(model, result) ?? keyFromWhere(model, args?.where);
+  if (!key) return result;
+
+  return (
+    ((await client[model.delegate].findUnique({ where: whereUnique(model, key) })) as
+      | Record<string, unknown>
+      | null) ?? result
+  );
 }
 
 /* -------------------------------------------------------------------------- */
@@ -287,7 +326,7 @@ async function runSingleRow(
   const revType =
     operation === "upsert" ? (existed ? "UPDATE" : "INSERT") : (REV_TYPE[operation] as string);
 
-  return { result, entries: [{ state, revType }] };
+  return { result, entries: [{ state, revType }], parentState: state };
 }
 
 async function rowExists(
@@ -543,22 +582,6 @@ function missingKeyForReread(model: AuditModel, call: string, rows: string): str
   );
 }
 
-async function readByKeys(
-  client: AnyClient,
-  model: AuditModel,
-  keys: EntityKey[],
-): Promise<Record<string, unknown>[]> {
-  if (keys.length === 0) return [];
-
-  const rows: Record<string, unknown>[] = [];
-
-  for (const chunk of chunks(keys, batchSize(model, CHUNK_SIZE))) {
-    rows.push(...(await client[model.delegate].findMany({ where: whereAnyOf(model, chunk) })));
-  }
-
-  return rows;
-}
-
 /**
  * Re-dispatch an operation on the client for prisma-audit's own purposes. The
  * call goes through the extension again, so it is marked as a bypass to keep it
@@ -582,12 +605,6 @@ function runBypassed(
 
 function isUniqueViolation(error: unknown): boolean {
   return (error as { code?: string } | null)?.code === UNIQUE_VIOLATION;
-}
-
-function* chunks<T>(items: T[], size: number): Generator<T[]> {
-  for (let index = 0; index < items.length; index += size) {
-    yield items.slice(index, index + size);
-  }
 }
 
 /* -------------------------------------------------------------------------- */
@@ -689,57 +706,31 @@ export async function resolveUser(options: AuditOptions): Promise<AuditUser | un
   return options.userProvider ? await options.userProvider() : undefined;
 }
 
-function findAuditable(metadata: AuditMetadata, modelName: string): AuditModel | undefined {
-  const model = metadata.models.find((candidate) => candidate.name === modelName);
-  return model?.auditable ? model : undefined;
-}
-
 /**
- * A write can reach a second model through a nested payload, and the extension
- * never sees that as an operation of its own — the related rows change with no
- * revision to show for it. Until nested writes are recorded, say so out loud
- * rather than leaving a silent hole in the history.
+ * A relation prisma-audit cannot follow: an implicit many-to-many names no join
+ * columns, and two relations to one model with no `@relation("name")` cannot be
+ * told apart. Rather than leave a silent hole in the history, say so once.
  */
-function warnNestedWrites(
+function warnNestedGaps(
   options: AuditOptions,
   warned: Set<string>,
   model: AuditModel,
   operation: string,
-  args: any,
+  gaps: NestedGap[],
 ): void {
-  const payloads = [args?.data, args?.create, args?.update].flatMap((payload) =>
-    Array.isArray(payload) ? payload : [payload],
-  );
+  for (const gap of gaps) {
+    const id = `${model.name}.${gap.relation}`;
+    if (warned.has(id)) continue;
+    warned.add(id);
 
-  for (const payload of payloads) {
-    if (!payload || typeof payload !== "object") continue;
-
-    for (const [key, value] of Object.entries(payload)) {
-      if (!value || typeof value !== "object") continue;
-
-      const field = model.fields.find(
-        (candidate) => candidate.name === key && candidate.kind === "relation",
-      );
-      if (!field) continue;
-
-      const target = findAuditable(options.metadata, field.type);
-      if (!target) continue;
-
-      if (!NESTED_WRITE_KEYS.some((nested) => nested in (value as object))) continue;
-
-      const id = `${model.name}.${key}`;
-      if (warned.has(id)) continue;
-      warned.add(id);
-
-      if (options.onNestedWrite) {
-        options.onNestedWrite(model.name, key, target.name);
-        continue;
-      }
-
-      console.warn(
-        `[prisma-audit] ${model.name}.${operation}() writes ${target.name} through the nested relation "${key}", ` +
-          `which is not audited yet; those rows will have no revision history.`,
-      );
+    if (options.onNestedWrite) {
+      options.onNestedWrite(model.name, gap.relation, gap.target);
+      continue;
     }
+
+    console.warn(
+      `[prisma-audit] ${model.name}.${operation}() writes ${gap.target} through the nested relation "${gap.relation}", ` +
+        `whose join columns the schema does not name, so prisma-audit cannot find those rows to record them.`,
+    );
   }
 }

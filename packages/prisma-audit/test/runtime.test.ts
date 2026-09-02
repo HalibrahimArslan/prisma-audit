@@ -27,13 +27,24 @@ model Product {
   categoryId Int?
   category   Category? @relation(fields: [categoryId], references: [id])
   stocks     Stock[]
+  tags       Tag[]
 }
 
 [Auditable]
 model Stock {
-  id        Int @id @default(autoincrement())
+  id        Int     @id @default(autoincrement())
   productId Int
   quantity  Int
+  product   Product @relation(fields: [productId], references: [id])
+}
+
+// An implicit many-to-many: neither side names a join column, so a nested
+// write through it is a gap prisma-audit reports rather than records.
+[Auditable]
+model Tag {
+  id       Int       @id @default(autoincrement())
+  label    String
+  products Product[]
 }
 
 [Auditable]
@@ -103,6 +114,13 @@ class FakeTable {
   /** Every statement the runtime issued, in order, for cost assertions. */
   readonly calls: string[] = [];
 
+  /**
+   * The to-many relations this table's nested payloads reach, by field name.
+   * Prisma resolves a nested write inside the one call, and so does this: the
+   * runtime must never see an operation of its own for the child rows.
+   */
+  relations: Record<string, { table: FakeTable; foreignKey: string }> = {};
+
   constructor(
     readonly model: string,
     readonly primaryKey: string[],
@@ -135,6 +153,66 @@ class FakeTable {
     return this.primaryKey.every((column) => a[column] === b[column]);
   }
 
+  /** Split a payload into this table's own columns and its nested relations. */
+  private split(data: Row = {}): { own: Row; nested: Array<[string, Row]> } {
+    const own: Row = {};
+    const nested: Array<[string, Row]> = [];
+
+    for (const [field, value] of Object.entries(data)) {
+      if (this.relations[field]) nested.push([field, value as Row]);
+      else own[field] = value;
+    }
+
+    return { own, nested };
+  }
+
+  /**
+   * Apply the nested payloads of one parent row, the way Prisma would: inside
+   * the same call, against the child table, with the foreign key filled in.
+   */
+  private applyNested(parent: Row, nested: Array<[string, Row]>): void {
+    for (const [field, payload] of nested) {
+      const { table, foreignKey } = this.relations[field] as {
+        table: FakeTable;
+        foreignKey: string;
+      };
+      const link = { [foreignKey]: parent[this.primaryKey[0] as string] };
+
+      for (const [operation, argument] of Object.entries(payload)) {
+        for (const one of [argument].flat()) {
+          const entry = one as Row;
+
+          switch (operation) {
+            case "create":
+            case "createMany":
+              table.create({ data: { ...entry, ...link } });
+              break;
+            case "update":
+              table.update({ where: entry.where ?? entry, data: entry.data ?? {} });
+              break;
+            case "updateMany":
+              table.updateMany({ where: { ...entry.where, ...link }, data: entry.data ?? {} });
+              break;
+            case "delete":
+              table.delete({ where: entry.where ?? entry });
+              break;
+            case "deleteMany":
+              table.deleteMany({ where: { ...(entry.where ?? entry), ...link } });
+              break;
+            case "connect":
+              table.update({ where: entry, data: link });
+              break;
+            case "disconnect":
+              table.update({ where: entry, data: { [foreignKey]: null } });
+              break;
+            default:
+              throw new Error(`the fake client does not implement nested ${operation}`);
+          }
+        }
+      }
+    }
+  }
+
   findMany(args: any = {}): Row[] {
     this.calls.push("findMany");
     const found = this.rows.filter((row) => matches(row, this.where(args.where)));
@@ -150,19 +228,22 @@ class FakeTable {
 
   create(args: any): Row {
     this.calls.push("create");
+    const { own, nested } = this.split(args.data);
+
     // A single-column key stands in for an autoincrement column; a composite
     // key is always supplied by the caller, as it is in the database.
     const generated =
-      this.primaryKey.length === 1 && args.data[this.primaryKey[0] as string] === undefined
+      this.primaryKey.length === 1 && own[this.primaryKey[0] as string] === undefined
         ? { [this.primaryKey[0] as string]: this.nextId++ }
         : {};
-    const row: Row = { ...generated, ...args.data };
+    const row: Row = { ...generated, ...own };
 
     if (this.rows.some((existing) => this.sameRow(existing, row))) {
       throw Object.assign(new Error("Unique constraint failed"), { code: "P2002" });
     }
 
     this.rows.push(row);
+    this.applyNested(row, nested);
     return project(row, args.select);
   }
 
@@ -183,7 +264,11 @@ class FakeTable {
     this.calls.push("update");
     const row = this.rows.find((candidate) => matches(candidate, this.where(args.where)));
     if (!row) throw new Error(`${this.model}: row not found`);
-    Object.assign(row, args.data);
+
+    const { own, nested } = this.split(args.data);
+    Object.assign(row, own);
+    this.applyNested(row, nested);
+
     return project(row, args.select);
   }
 
@@ -277,9 +362,13 @@ interface Harness {
   stock: FakeTable;
   /** A model keyed `@@id([orderId, lineNo])`, for the composite-key paths. */
   orderLine: FakeTable;
+  tag: FakeTable;
+  /** Not [Auditable], but its nested payloads reach a model that is. */
+  category: FakeTable;
   productAud: FakeAuditTable;
   stockAud: FakeAuditTable;
   orderLineAud: FakeAuditTable;
+  tagAud: FakeAuditTable;
   revision: FakeRevisionTable;
   warnings: string[];
 }
@@ -297,6 +386,13 @@ function harness(overrides: Partial<AuditOptions> = {}, returning = true): Harne
   const productAud = new FakeAuditTable("ProductAud", ["id"]);
   const stockAud = new FakeAuditTable("StockAud", ["id"]);
   const orderLineAud = new FakeAuditTable("OrderLineAud", ["orderId", "lineNo"]);
+  const tag = new FakeTable("Tag", ["id"], returning);
+  const tagAud = new FakeAuditTable("TagAud", ["id"]);
+
+  const category = new FakeTable("Category", ["id"], returning);
+
+  product.relations = { stocks: { table: stock, foreignKey: "productId" } };
+  category.relations = { products: { table: product, foreignKey: "categoryId" } };
   const revision = new FakeRevisionTable();
   const warnings: string[] = [];
 
@@ -315,9 +411,10 @@ function harness(overrides: Partial<AuditOptions> = {}, returning = true): Harne
     productAud,
     stockAud,
     orderLineAud,
+    tagAud,
   };
 
-  for (const table of [product, stock, orderLine]) {
+  for (const table of [product, stock, orderLine, tag, category]) {
     // Prisma lower-cases only the first character: `OrderLine` -> `orderLine`.
     const delegate = table.model.charAt(0).toLowerCase() + table.model.slice(1);
 
@@ -348,9 +445,12 @@ function harness(overrides: Partial<AuditOptions> = {}, returning = true): Harne
     product,
     stock,
     orderLine,
+    tag,
+    category,
     productAud,
     stockAud,
     orderLineAud,
+    tagAud,
     revision,
     warnings,
   };
@@ -742,22 +842,166 @@ describe("revisions", () => {
 });
 
 describe("nested writes", () => {
-  it("warns once per relation that reaches an audited model", async () => {
+  it("records a row created through a relation, under the same revision", async () => {
+    const h = harness();
+    h.product.rows.push({ id: 1, name: "a", price: 10, categoryId: null });
+
+    await inRevision(h, () =>
+      h.client.product.update({
+        where: { id: 1 },
+        data: { name: "b", stocks: { create: { quantity: 3 } } },
+      }),
+    );
+
+    assert.equal(h.productAud.rows.length, 1);
+    assert.deepEqual(h.stockAud.rows, [
+      { revisionId: 1n, revType: "INSERT", id: 1, productId: 1, quantity: 3 },
+    ]);
+    // A followable relation is audited, not warned about.
+    assert.deepEqual(h.warnings, []);
+  });
+
+  it("records a nested update, and the row it did not touch stays out", async () => {
+    const h = harness();
+    h.product.rows.push({ id: 1, name: "a", price: 10, categoryId: null });
+    h.stock.rows.push({ id: 1, productId: 1, quantity: 5 }, { id: 2, productId: 1, quantity: 9 });
+
+    await inRevision(h, () =>
+      h.client.product.update({
+        where: { id: 1 },
+        data: { stocks: { update: { where: { id: 1 }, data: { quantity: 6 } } } },
+      }),
+    );
+
+    assert.deepEqual(h.stockAud.rows, [
+      { revisionId: 1n, revType: "UPDATE", id: 1, productId: 1, quantity: 6 },
+    ]);
+  });
+
+  it("records a nested delete from the row as it stood before", async () => {
+    const h = harness();
+    h.product.rows.push({ id: 1, name: "a", price: 10, categoryId: null });
+    h.stock.rows.push({ id: 1, productId: 1, quantity: 5 });
+
+    await inRevision(h, () =>
+      h.client.product.update({
+        where: { id: 1 },
+        data: { stocks: { deleteMany: {} } },
+      }),
+    );
+
+    assert.equal(h.stock.rows.length, 0);
+    assert.deepEqual(h.stockAud.rows, [
+      { revisionId: 1n, revType: "DELETE", id: 1, productId: 1, quantity: 5 },
+    ]);
+  });
+
+  it("tells a connected row from a created one", async () => {
+    const h = harness();
+    h.product.rows.push(
+      { id: 1, name: "a", price: 10, categoryId: null },
+      { id: 2, name: "b", price: 10, categoryId: null },
+    );
+    // Already exists, pointing at the other product.
+    h.stock.rows.push({ id: 1, productId: 2, quantity: 5 });
+
+    await inRevision(h, () =>
+      h.client.product.update({
+        where: { id: 1 },
+        data: { stocks: { connect: { id: 1 } } },
+      }),
+    );
+
+    // The row was named by key, so it was known before the write: what changed
+    // is its foreign key, which is an update and not an insert.
+    assert.deepEqual(h.stockAud.rows, [
+      { revisionId: 1n, revType: "UPDATE", id: 1, productId: 1, quantity: 5 },
+    ]);
+  });
+
+  it("records a disconnected row as the update it is, not a delete", async () => {
+    const h = harness();
+    h.product.rows.push({ id: 1, name: "a", price: 10, categoryId: null });
+    h.stock.rows.push({ id: 1, productId: 1, quantity: 5 });
+
+    await inRevision(h, () =>
+      h.client.product.update({
+        where: { id: 1 },
+        data: { stocks: { disconnect: { id: 1 } } },
+      }),
+    );
+
+    assert.equal(h.stock.rows.length, 1);
+    assert.deepEqual(h.stockAud.rows, [
+      { revisionId: 1n, revType: "UPDATE", id: 1, productId: null, quantity: 5 },
+    ]);
+  });
+
+  it("leaves a related row alone when the write did not change it", async () => {
+    const h = harness();
+    h.product.rows.push({ id: 1, name: "a", price: 10, categoryId: null });
+    h.stock.rows.push({ id: 1, productId: 1, quantity: 5 });
+
+    await inRevision(h, () =>
+      h.client.product.update({
+        where: { id: 1 },
+        data: { name: "b", stocks: { updateMany: { where: {}, data: { quantity: 5 } } } },
+      }),
+    );
+
+    // Every related row is read, but only a changed one is recorded.
+    assert.deepEqual(h.stockAud.rows, []);
+    assert.equal(h.productAud.rows.length, 1);
+  });
+
+  it("follows a write made on a model that is not itself audited", async () => {
+    const h = harness();
+    h.category.rows.push({ id: 1, name: "Phones" });
+
+    // Category carries no [Auditable], so nothing about it is recorded — but the
+    // write reaches Product, which is audited, and that has to be.
+    await inRevision(h, () =>
+      h.client.category.update({
+        where: { id: 1 },
+        data: { name: "Mobiles", products: { create: { name: "a", price: 1 } } },
+      }),
+    );
+
+    assert.deepEqual(h.productAud.rows, [
+      { revisionId: 1n, revType: "INSERT", id: 1, name: "a", price: 1, categoryId: 1 },
+    ]);
+  });
+
+  it("opens a revision for a nested write made outside $auditTransaction", async () => {
+    const h = harness();
+    h.product.rows.push({ id: 1, name: "a", price: 10, categoryId: null });
+
+    await h.client.product.update({
+      where: { id: 1 },
+      data: { stocks: { create: { quantity: 3 } } },
+    });
+
+    assert.equal(h.revision.rows.length, 1);
+    assert.equal(h.stockAud.rows[0]?.revisionId, 1n);
+    assert.equal(h.productAud.rows[0]?.revisionId, 1n);
+  });
+
+  it("warns once for a relation whose join columns the schema does not name", async () => {
     const h = harness();
     h.product.rows.push({ id: 1, name: "a", price: 10, categoryId: null });
 
     await inRevision(h, async () => {
       await h.client.product.update({
         where: { id: 1 },
-        data: { name: "b", stocks: { create: { quantity: 1 } } },
+        data: { name: "b", tags: { connect: { id: 1 } } },
       });
       await h.client.product.update({
         where: { id: 1 },
-        data: { name: "c", stocks: { create: { quantity: 2 } } },
+        data: { name: "c", tags: { connect: { id: 2 } } },
       });
     });
 
-    assert.deepEqual(h.warnings, ["Product.stocks -> Stock"]);
+    assert.deepEqual(h.warnings, ["Product.tags -> Tag"]);
   });
 
   it("stays quiet for a relation to a model that is not audited", async () => {

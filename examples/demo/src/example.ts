@@ -62,6 +62,65 @@ async function main(): Promise<void> {
   await report(product.id);
   await bulk(category.id);
   await composite();
+  await nested(category.id);
+}
+
+/**
+ * A nested write reaches a second model inside one Prisma call, and the
+ * extension never sees an operation of its own for it. prisma-audit reads the
+ * rows the payload can reach before and after the statement and records the
+ * difference — the statement itself is left exactly as it was written.
+ */
+async function nested(categoryId: number): Promise<void> {
+  const created = await prisma.$auditTransaction(halil, async (tx) =>
+    tx.product.create({
+      data: {
+        name: "Pixel Fold",
+        price: 60_000,
+        categoryId,
+        stock: { create: { quantity: 4 } },
+      },
+    }),
+  );
+
+  await prisma.$auditTransaction(ahmet, async (tx) => {
+    await tx.product.update({
+      where: { id: created.id },
+      data: {
+        price: 58_000,
+        stock: { update: { quantity: 2 } },
+      },
+    });
+  });
+
+  // The nested delete leaves the stock row's last state in the history.
+  await prisma.$auditTransaction(halil, async (tx) => {
+    await tx.product.update({
+      where: { id: created.id },
+      data: { stock: { delete: true } },
+    });
+  });
+
+  console.log("\n── Nested writes: what each revision recorded ──────────────");
+  for (const revision of (await prisma.audit.revisions(3)).reverse()) {
+    const changes = revision.changes
+      .map((change) => `${change.model}#${formatKey(change.id)} ${change.revType}`)
+      .join(", ");
+    console.log(`  rev ${String(revision.id).padStart(3)}  ${revision.username ?? "-"}  ${changes}`);
+  }
+
+  const stockId = (await prisma.audit.revisions(3))
+    .flatMap((revision) => revision.changes)
+    .find((change) => change.model === "Stock")?.id;
+
+  console.log("\n── Nested writes: the stock row's own history ──────────────");
+  for (const entry of await prisma.audit.for("Stock").id(stockId).getRevisions()) {
+    const entity = entry.entity as Record<string, unknown>;
+    console.log(
+      `  rev ${String(entry.revisionId).padStart(3)}  ${entry.revType.padEnd(6)}` +
+        `  by ${(entry.user.username ?? "-").padEnd(6)}  quantity=${String(entity.quantity)}`,
+    );
+  }
 }
 
 /**

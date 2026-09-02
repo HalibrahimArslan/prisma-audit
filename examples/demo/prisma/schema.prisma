@@ -36,6 +36,8 @@ model Product {
 
   [NotAudited]
   updatedAt DateTime @updatedAt
+
+  stock Stock?
 }
 
 // The audit table is named explicitly here: the generated model becomes
@@ -43,9 +45,10 @@ model Product {
 [Auditable]
 [AuditTable(StockHistory)]
 model Stock {
-  id        Int @id @default(autoincrement())
-  productId Int @unique
+  id        Int     @id @default(autoincrement())
+  productId Int     @unique
   quantity  Int
+  product   Product @relation(fields: [productId], references: [id])
 }
 
 // A model keyed by two columns. The audit table is keyed the same way, on

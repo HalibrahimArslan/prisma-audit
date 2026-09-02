@@ -24,6 +24,22 @@ export type PrismaScalar = (typeof PRISMA_SCALARS)[number];
 
 export type AuditFieldKind = "scalar" | "enum" | "relation" | "unsupported";
 
+/**
+ * How a relation field is joined, as `@relation(...)` writes it.
+ *
+ * Only the owning side of a relation carries `fields`/`references`; the other
+ * side carries the relation name at most. prisma-audit needs both to find the
+ * rows a nested write reaches.
+ */
+export interface AuditRelation {
+  /** The scalar columns on this model that hold the foreign key. */
+  fields?: string[];
+  /** The columns those point at, on the related model. */
+  references?: string[];
+  /** The `@relation("name")`, which tells two relations to one model apart. */
+  name?: string;
+}
+
 export interface AuditField {
   /** Field name as written in `schema.prisma`. */
   name: string;
@@ -45,6 +61,8 @@ export interface AuditField {
   audited: boolean;
   /** Why an otherwise normal field ended up with `audited: false`. */
   excludedBy?: "annotation" | "relation" | "list";
+  /** How the relation is joined. Only present when `kind` is `"relation"`. */
+  relation?: AuditRelation;
   /** 1-based line in the source schema, used for error messages. */
   line: number;
 }
@@ -79,13 +97,15 @@ export interface AuditModel {
 }
 
 /** The metadata format this build of prisma-audit writes and reads. */
-export const METADATA_VERSION = 2;
+export const METADATA_VERSION = 3;
 
 export interface AuditMetadata {
   /**
    * Metadata format version, bumped when the shape changes. Version 2 turned
    * `AuditModel.primaryKey` from a single column name into the list of columns
-   * that form the key; `loadMetadata` upgrades a version 1 file in memory.
+   * that form the key; version 3 added `AuditField.relation`, which is what
+   * lets a nested write be followed to the rows it reaches. `loadMetadata`
+   * upgrades an older file in memory as far as it can.
    */
   version: number;
   /** Every model found in the schema, audited or not. */

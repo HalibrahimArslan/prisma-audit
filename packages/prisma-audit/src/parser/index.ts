@@ -4,10 +4,12 @@ import {
   METADATA_VERSION,
   PRISMA_SCALARS,
   type AuditField,
+  type AuditRelation,
   type AuditFieldKind,
   type AuditMetadata,
   type AuditModel,
 } from "../metadata.js";
+import { splitAttributes } from "../util/attributes.js";
 import { toDelegateName, toSnakeCase } from "../util/naming.js";
 import {
   ANNOTATIONS,
@@ -262,6 +264,40 @@ function parseModelLine(
   model.fields.push(field);
 }
 
+/** `[a, b]` inside an attribute argument, e.g. `fields: [categoryId]`. */
+const LIST_ARGUMENT = /\b(fields|references)\s*:\s*\[([^\]]*)\]/g;
+/** The relation name, written either positionally or as `name:`. */
+const RELATION_NAME = /(?:^\(|\bname\s*:\s*)"([^"]+)"/;
+
+/**
+ * Read `@relation(fields: [categoryId], references: [id])` off a field.
+ *
+ * Only the owning side of a relation names its columns; the other side has at
+ * most a relation name, and a relation with neither — an implicit many-to-many —
+ * yields nothing to join on, which is exactly what the caller has to know.
+ */
+function parseRelation(attributes: string): AuditRelation | undefined {
+  const attribute = splitAttributes(attributes).find((candidate) => candidate.name === "relation");
+  if (!attribute) return undefined;
+
+  const relation: AuditRelation = {};
+
+  for (const [, argument, list] of attribute.text.matchAll(LIST_ARGUMENT)) {
+    const columns = (list as string)
+      .split(",")
+      .map((column) => column.trim())
+      .filter((column) => column.length > 0);
+
+    if (argument === "fields") relation.fields = columns;
+    else relation.references = columns;
+  }
+
+  const name = RELATION_NAME.exec(attribute.text.slice("@relation".length));
+  if (name) relation.name = name[1] as string;
+
+  return relation;
+}
+
 /** One `[Annotation]` waiting for the declaration it belongs to. */
 interface PendingAnnotation {
   name: string;
@@ -399,6 +435,11 @@ function resolveFieldKinds(metadata: AuditMetadata): void {
       // Relations and list columns are out of scope for the MVP: a relation is
       // audited through the model it points at, and a list column would need a
       // history table of its own.
+      if (kind === "relation") {
+        const relation = parseRelation(field.attributes);
+        if (relation) field.relation = relation;
+      }
+
       if (kind === "relation" && field.audited) {
         field.audited = false;
         field.excludedBy = "relation";
