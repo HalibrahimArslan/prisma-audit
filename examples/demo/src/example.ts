@@ -60,6 +60,68 @@ async function main(): Promise<void> {
   });
 
   await report(product.id);
+  await bulk(category.id);
+}
+
+/**
+ * Bulk and branching writes. Each one reports a row count rather than the rows
+ * it touched, so prisma-audit pairs it with a read on the same transaction and
+ * records one audit row per affected record.
+ */
+async function bulk(categoryId: number): Promise<void> {
+  await prisma.$auditTransaction(halil, async (tx) => {
+    await tx.product.createMany({
+      data: [
+        { name: "Pixel", price: 30_000, categoryId },
+        { name: "Galaxy", price: 40_000, categoryId },
+      ],
+    });
+  });
+
+  // One statement, two rows, two audit records — all under a single revision.
+  await prisma.$auditTransaction(ahmet, async (tx) => {
+    await tx.product.updateMany({
+      where: { name: { in: ["Pixel", "Galaxy"] } },
+      data: { price: 45_000 },
+    });
+  });
+
+  // upsert branches inside the database; the revision type follows.
+  await prisma.$auditTransaction(halil, async (tx) => {
+    await tx.product.upsert({
+      where: { id: 999 },
+      create: { id: 999, name: "Nothing Phone", price: 20_000, categoryId },
+      update: { price: 21_000 },
+    });
+    await tx.product.upsert({
+      where: { id: 999 },
+      create: { id: 999, name: "Nothing Phone", price: 20_000, categoryId },
+      update: { price: 21_000 },
+    });
+  });
+
+  await prisma.$auditTransaction(ahmet, async (tx) => {
+    await tx.product.deleteMany({ where: { name: "Galaxy" } });
+  });
+
+  console.log("\n── Bulk writes ─────────────────────────────────────────────");
+  for (const revision of (await prisma.audit.revisions(4)).reverse()) {
+    const changes = revision.changes
+      .map((change) => `${change.model}#${String(change.id)} ${change.revType}`)
+      .join(", ");
+    console.log(`  rev ${String(revision.id).padStart(3)}  ${revision.username ?? "-"}  ${changes}`);
+  }
+
+  // The second upsert of the same row in one revision updated the record the
+  // first one wrote, and the revision stayed an INSERT: that is what it did.
+  const nothingPhone = await prisma.audit.for("Product").id(999).getRevisions();
+  console.log("\n── upsert twice in one revision ────────────────────────────");
+  for (const entry of nothingPhone) {
+    const entity = entry.entity as Record<string, unknown>;
+    console.log(
+      `  rev ${String(entry.revisionId).padStart(3)}  ${entry.revType.padEnd(6)}  price=${String(entity.price)}`,
+    );
+  }
 }
 
 async function report(productId: number): Promise<void> {

@@ -42,6 +42,7 @@ const BLOCK_START =
   /^\s*(model|enum|type|view|datasource|generator)\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{/;
 const FIELD =
   /^\s*([A-Za-z_][A-Za-z0-9_]*)\s+([A-Za-z_][A-Za-z0-9_]*)(\[\])?(\?)?\s*(.*)$/;
+const PROVIDER = /^\s*provider\s*=\s*"([^"]+)"/;
 
 /** Field names the generator reserves on every audit model. */
 export const RESERVED_AUDIT_FIELDS = ["revisionId", "revision", "revType"];
@@ -60,6 +61,8 @@ export function parseSchemaText(source: string): ParseResult {
   let pending: { name: string; line: number } | null = null;
   let currentModel: AuditModel | null = null;
   let currentBlock: string | null = null;
+  /** The `datasource` provider, which decides some runtime strategies. */
+  let provider: string | undefined;
 
   const failPending = () => {
     if (pending) {
@@ -143,6 +146,9 @@ export function parseSchemaText(source: string): ParseResult {
     if (currentBlock === "model" && currentModel) {
       parseModelLine(currentModel, line, lineNumber, pending);
       pending = null;
+    } else if (currentBlock === "datasource") {
+      const match = PROVIDER.exec(line);
+      if (match) provider = match[1] as string;
     } else if (pending) {
       throw new AuditSchemaError(
         `[${pending.name}] must be followed by a model or a field declaration`,
@@ -156,6 +162,7 @@ export function parseSchemaText(source: string): ParseResult {
   failPending();
 
   const metadata: AuditMetadata = { version: 1, models, enums };
+  if (provider) metadata.provider = provider;
   resolveFieldKinds(metadata);
   validate(metadata);
 

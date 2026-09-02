@@ -18,6 +18,22 @@ export interface AuditContext {
    * on, so the two either commit together or roll back together.
    */
   tx?: unknown;
+  /**
+   * Rows already audited in this revision, keyed `Model#id`, holding the
+   * revision type they were written with.
+   *
+   * An audit table is keyed `(revisionId, id)`, so a row touched twice in the
+   * same revision has to update its existing audit record rather than insert a
+   * second one. The map also lets the common case stay fast: when none of the
+   * rows in a batch have been seen, they can all be inserted at once.
+   */
+  written?: Map<string, string>;
+  /**
+   * Set while prisma-audit re-dispatches an operation on the client for its own
+   * purposes, so the interceptor lets that call straight through instead of
+   * auditing it a second time.
+   */
+  bypass?: boolean;
 }
 
 const storage = new AsyncLocalStorage<AuditContext>();

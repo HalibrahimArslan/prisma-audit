@@ -100,9 +100,12 @@ export function withAudit<C extends PrismaClientLike>(
           // Awaited inside the scope on purpose: Prisma model calls are lazy,
           // so an unawaited promise would execute after the context had been
           // left and the write would look unaudited.
-          return runWithAuditContext({ user, revisionId: revision.id, tx }, async () => {
-            return await fn(tx);
-          });
+          return runWithAuditContext(
+            { user, revisionId: revision.id, tx, written: new Map() },
+            async () => {
+              return await fn(tx);
+            },
+          );
         }, txOptions);
       },
     },

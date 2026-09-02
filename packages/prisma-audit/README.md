@@ -33,6 +33,26 @@ Status: **working end to end** against PostgreSQL and Prisma 7. See
 
 ---
 
+## Install
+
+Not on npm yet, so install it from a tarball built out of this repository:
+
+```bash
+pnpm install && pnpm build
+cd packages/prisma-audit && npm pack        # -> prisma-audit-0.1.0.tgz
+```
+
+```bash
+# in your own project
+npm install /path/to/prisma-audit-0.1.0.tgz
+```
+
+That gives you both the `prisma-audit` CLI and the runtime. `@prisma/client` is
+an optional peer dependency: the parser, generator and CLI need nothing but
+Node 20+, and `withAudit()` wraps the client your project already has.
+
+---
+
 ## How it works
 
 `schema.prisma` is the file you edit, and it is *not* handed to the Prisma CLI —
@@ -155,6 +175,7 @@ export const prisma = withAudit(new PrismaClient({ adapter }), {
   metadata: loadMetadata("prisma/.audit/audit.metadata.json"),
   userProvider: () => currentRequestUser(),   // optional
   onMissingRevision: "transaction",           // "transaction" | "skip" | "error"
+  onNestedWrite: (model, relation, target) => {},  // optional, replaces the warning
 });
 ```
 
@@ -182,13 +203,44 @@ prisma.audit.createQuery().forEntity("Product").id(10).getRevisions();
 
 ---
 
+## Bulk and branching writes
+
+`createMany`, `updateMany`, `deleteMany` and `upsert` report a row count, not the
+rows they touched, so each one is paired with a read inside the same transaction.
+That is the cost, stated plainly: one statement becomes two.
+
+| operation                                    | strategy                                                                       |
+| -------------------------------------------- | ------------------------------------------------------------------------------ |
+| `updateMany`                                 | read the matching keys, write, then read the new state back                    |
+| `deleteMany`                                 | read the matching rows in full first — after the delete there is nothing to read |
+| `createMany`                                 | run it as `createManyAndReturn` where the database has it, else insert row by row |
+| `createManyAndReturn` / `updateManyAndReturn` | audited from the rows the statement returns                                    |
+| `upsert`                                     | a key lookup before the write decides between an INSERT and an UPDATE revision |
+
+Rows are read back, and audit rows written, in batches of 1000, so a bulk write
+over a large table does not run into the database's bind-parameter limit.
+
+A row touched more than once in one revision keeps a single audit record — the
+audit table is keyed `(revisionId, id)` — holding the state the row ended up in.
+A row created and then changed within the same revision stays an `INSERT`.
+
+With `limit`, the database chooses which of the matching rows to touch, so
+prisma-audit re-issues the statement against exactly the keys it read. Without
+`limit` the caller's filter is used as written: a row another transaction inserts
+between the read and the write would be changed without an audit row. Raise the
+isolation level if that matters.
+
+---
+
 ## Current limitations
 
-`createMany`, `updateMany`, `deleteMany` and `upsert` are not recorded yet — they
-pass through with a one-time warning. Composite primary keys are rejected at
-generate time with a clear message. Nested writes are audited only for the
-top-level model. List columns and relation fields are excluded from audit tables;
-the scalar foreign key is kept.
+Composite primary keys are rejected at generate time with a clear message.
+Nested writes (`product.update({ data: { stocks: { create: … } } })`) are audited
+only for the top-level model; when the nested model is `[Auditable]`, prisma-audit
+warns once per relation instead of leaving a silent gap. List columns and relation
+fields are excluded from audit tables; the scalar foreign key is kept. A write
+that never goes through Prisma — raw SQL, another service — leaves no trace;
+database triggers are on the roadmap.
 
 ---
 

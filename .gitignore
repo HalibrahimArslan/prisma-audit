@@ -6,3 +6,5 @@ examples/demo/prisma/.audit/
 examples/demo/src/generated/
 dist-test/
 examples/demo/prisma/.audit/
+*.tgz
+.vscode/

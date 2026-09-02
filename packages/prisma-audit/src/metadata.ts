@@ -75,6 +75,12 @@ export interface AuditMetadata {
   models: AuditModel[];
   /** Enum names declared in the schema; used to tell enums from relations. */
   enums: string[];
+  /**
+   * The `datasource` provider, e.g. `postgresql`. Optional because metadata
+   * written before this field existed does not carry it; the runtime treats an
+   * absent provider as "assume the least capable database".
+   */
+  provider?: string;
 }
 
 /** The audited fields of a model, in schema order. */

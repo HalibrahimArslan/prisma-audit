@@ -1,7 +1,7 @@
 # Roadmap
 
-The plan the project is being built against. Milestones 0–3 are done and verified
-against a real PostgreSQL database; everything from M4 on is open work.
+The plan the project is being built against. Milestones 0–4 are done and verified
+against a real PostgreSQL database; everything from M5 on is open work.
 
 ---
 
@@ -45,7 +45,8 @@ is *our* source file, preprocessed into a Prisma-ready schema.
 - `create` / `update` / `delete` are audited from the operation result, which
   Prisma returns in full, so the common path costs no extra query. A `select` or
   `omit` triggers a re-read (and a read-before-delete).
-- Unsupported bulk operations warn once and pass through.
+- Bulk and branching operations were left passing through at this point; M4
+  closed that gap.
 
 ## M3 — AuditReader ✅
 
@@ -57,23 +58,43 @@ is *our* source file, preprocessed into a Prisma-ready schema.
 
 ---
 
-## M4 — Bulk and branching operations
+## M4 — Bulk and branching operations ✅
 
-The main correctness gap. Each needs a read-before-write strategy:
+Every write operation Prisma exposes is now recorded. A bulk statement reports a
+count rather than the rows it touched, so each one is paired with a read on the
+same transaction — the documented cost is that one statement becomes two.
 
-- `updateMany` / `deleteMany`: select the matching rows inside the transaction
-  first, then write one audit row per affected record.
-- `createMany`: `createManyAndReturn` gives the rows back on PostgreSQL; the
-  fallback is a per-row path.
-- `upsert`: resolve to INSERT or UPDATE from whether the row existed.
-- Decide and document the cost: these turn one statement into two.
+- `updateMany`: read the matching keys, write, read the new state back. With
+  `limit` the statement is re-issued against exactly those keys, because
+  otherwise the database is free to pick a different set of rows than the one
+  that was read.
+- `deleteMany`: read the matching rows in full first; afterwards there is
+  nothing left to read.
+- `createMany`: dispatched as `createManyAndReturn` where the delegate has it —
+  Prisma only generates that method for databases that support it, which makes
+  the delegate its own capability check. Elsewhere the insert is replayed row by
+  row, honouring `skipDuplicates`. The `datasource` provider is now carried in
+  `audit.metadata.json`, since SQLite has the method but rejects
+  `skipDuplicates` on it.
+- `createManyAndReturn` / `updateManyAndReturn`: audited from the returned rows,
+  re-read when `select`/`omit` narrowed them.
+- `upsert`: a key lookup before the write decides INSERT from UPDATE.
+- A row touched twice in one revision keeps one audit record, holding the state
+  it ended up in; created-then-changed stays an INSERT. Bulk writes make that
+  overlap ordinary, and the audit table's `(revisionId, id)` key would otherwise
+  reject the second write.
+- Reads and audit inserts are chunked at 1000 rows, to stay under the
+  bind-parameter limit on a large bulk write.
+- Internal re-dispatches carry a bypass flag in the audit context, so a
+  statement prisma-audit issues on the client is not audited twice.
 
 ## M5 — Schema coverage
 
 - Composite primary keys — the generator, `@@id`, and every reader query assume
   a single key column today.
 - Nested writes: `product.update({ data: { orderLines: { create: … } } })`
-  currently audits only the top-level model.
+  currently audits only the top-level model. The gap is at least loud now — a
+  nested write that reaches an `[Auditable]` model warns once per relation.
 - Relation auditing strategies, e.g. auditing an aggregate together with its children.
 - Configurable audit table naming (`[AuditTable(ProductHistory)]`).
 
@@ -90,7 +111,9 @@ The extension only sees what goes through Prisma. A raw `UPDATE` leaves no trace
 ## M7 — Release
 
 - CI: unit tests plus the demo against a PostgreSQL service container.
-- `tsup` or `tsc` build validated by publishing a tarball and installing it.
+- ✅ `tsc` build validated by `npm pack` and installing the tarball into a
+  scratch project: the CLI, parser, generator and runtime all resolve with
+  `@prisma/client` absent.
 - MySQL and SQLite verification; the generator is portable but untested there.
 - Documented upgrade path for `audit.metadata.json` version bumps.
 - Publish `prisma-audit` to npm.
