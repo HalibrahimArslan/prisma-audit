@@ -208,6 +208,114 @@ describe("parser", () => {
     );
   });
 
+  it("marks a relation as part of the model's aggregate", () => {
+    const { metadata } = parseSchemaText(
+      `[Auditable]
+model Order {
+  id    Int @id
+
+  [AuditedRelation]
+  lines OrderLine[]
+}
+
+[Auditable]
+model OrderLine {
+  id      Int   @id
+  orderId Int
+  order   Order @relation(fields: [orderId], references: [id])
+}
+`,
+    );
+
+    const lines = metadata.models[0]?.fields.find((field) => field.name === "lines");
+    assert.equal(lines?.aggregate, true);
+    // It is still a relation field, so it is not a column of the audit table.
+    assert.equal(lines?.audited, false);
+  });
+
+  it("rejects [AuditedRelation] on the side that holds the foreign key", () => {
+    assert.throws(
+      () =>
+        parseSchemaText(
+          `[Auditable]
+model Order {
+  id    Int         @id
+  lines OrderLine[]
+}
+
+[Auditable]
+model OrderLine {
+  id      Int   @id
+  orderId Int
+
+  [AuditedRelation]
+  order   Order @relation(fields: [orderId], references: [id])
+}
+`,
+        ),
+      /OrderLine holds the foreign key.*annotate the matching relation on Order instead/s,
+    );
+  });
+
+  it("rejects [AuditedRelation] to a model that is not audited", () => {
+    assert.throws(
+      () =>
+        parseSchemaText(
+          `[Auditable]
+model Order {
+  id    Int @id
+
+  [AuditedRelation]
+  lines OrderLine[]
+}
+
+model OrderLine {
+  id      Int   @id
+  orderId Int
+  order   Order @relation(fields: [orderId], references: [id])
+}
+`,
+        ),
+      /has to be \[Auditable\] too/,
+    );
+  });
+
+  it("rejects [AuditedRelation] whose join column is [NotAudited]", () => {
+    assert.throws(
+      () =>
+        parseSchemaText(
+          `[Auditable]
+model Order {
+  id    Int @id
+
+  [AuditedRelation]
+  lines OrderLine[]
+}
+
+[Auditable]
+model OrderLine {
+  id      Int   @id
+
+  [NotAudited]
+  orderId Int
+  order   Order @relation(fields: [orderId], references: [id])
+}
+`,
+        ),
+      /cannot be \[NotAudited\]: the audit table joins on it/,
+    );
+  });
+
+  it("rejects [AuditedRelation] on a field that is not a relation", () => {
+    assert.throws(
+      () =>
+        parseSchemaText(
+          "[Auditable]\nmodel A {\n  id Int @id\n\n  [AuditedRelation]\n  name String\n}\n",
+        ),
+      /belongs on a relation field/,
+    );
+  });
+
   it("rejects an auditable model without a primary key", () => {
     assert.throws(
       () => parseSchemaText("[Auditable]\nmodel A {\n  name String\n}\n"),

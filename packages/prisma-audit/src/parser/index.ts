@@ -615,7 +615,7 @@ function validateAggregateRelation(
 
   if (link.kind !== "child-owns") {
     throw new AuditSchemaError(
-      `${model.name}.${field.name} is ${annotation}, but ${model.name} holds the foreign key: the aggregate root is the side the other model points at, so put ${annotation} on ${target.name}'s side`,
+      `${model.name}.${field.name} is ${annotation}, but ${model.name} holds the foreign key. An aggregate root is the side the other model points at, so annotate the matching relation on ${target.name} instead`,
       field.line,
     );
   }
