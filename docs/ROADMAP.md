@@ -90,8 +90,15 @@ same transaction — the documented cost is that one statement becomes two.
 
 ## M5 — Schema coverage
 
-- Composite primary keys — the generator, `@@id`, and every reader query assume
-  a single key column today.
+- ✅ Composite primary keys. A model's key is a vector of columns rather than a
+  scalar throughout: the parser reads `@@id([a, b])` (and the `name:` Prisma
+  gives its compound argument), the audit table is keyed
+  `@@id([revisionId, a, b])`, and `util/keys.ts` derives every `where` the
+  runtime and the reader build from that vector. `.id({ orderId, lineNo })`
+  reads the history, which is the same shape `revisions()` reports for a
+  change. There is no `IN (...)` form for a multi-column key, so bulk reads
+  list the keys as alternatives and are chunked by key width. Verified against
+  PostgreSQL by the demo.
 - Nested writes: `product.update({ data: { orderLines: { create: … } } })`
   currently audits only the top-level model. The gap is at least loud now — a
   nested write that reaches an `[Auditable]` model warns once per relation.
@@ -115,7 +122,10 @@ The extension only sees what goes through Prisma. A raw `UPDATE` leaves no trace
   scratch project: the CLI, parser, generator and runtime all resolve with
   `@prisma/client` absent.
 - MySQL and SQLite verification; the generator is portable but untested there.
-- Documented upgrade path for `audit.metadata.json` version bumps.
+- ✅ Upgrade path for `audit.metadata.json`: the file is versioned, and
+  `loadMetadata` upgrades an older one in memory rather than refusing to start.
+  Version 1 → 2, which widened `primaryKey` to a list of columns, is the first
+  such step.
 - Publish `prisma-audit` to npm.
 
 ---

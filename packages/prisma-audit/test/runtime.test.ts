@@ -36,6 +36,15 @@ model Stock {
   quantity  Int
 }
 
+[Auditable]
+model OrderLine {
+  orderId  Int
+  lineNo   Int
+  quantity Int
+
+  @@id([orderId, lineNo])
+}
+
 model Category {
   id       Int       @id @default(autoincrement())
   name     String
@@ -56,6 +65,11 @@ function matches(row: Row, where: Row | undefined): boolean {
   if (!where) return true;
 
   return Object.entries(where).every(([field, condition]) => {
+    // The runtime asks for a set of composite-key rows as a list of alternatives.
+    if (field === "OR") {
+      return (condition as Row[]).some((alternative) => matches(row, alternative));
+    }
+
     const value = row[field];
 
     if (condition !== null && typeof condition === "object") {
@@ -91,7 +105,7 @@ class FakeTable {
 
   constructor(
     readonly model: string,
-    readonly primaryKey: string,
+    readonly primaryKey: string[],
     /** Databases without `createManyAndReturn` simply do not have the method. */
     returning = true,
   ) {
@@ -100,24 +114,51 @@ class FakeTable {
     if (!returning) (this as any).createManyAndReturn = undefined;
   }
 
+  /**
+   * Prisma names a composite key as one nested argument — `where: { orderId_lineNo:
+   * { … } }` — so unwrap it into the flat form the matcher works with. A
+   * single-column key is already flat, and its compound name is the column
+   * itself, so only a composite key is unwrapped.
+   */
+  private where(where: Row | undefined): Row | undefined {
+    if (this.primaryKey.length < 2) return where;
+
+    const name = this.primaryKey.join("_");
+    const compound = where?.[name];
+    if (!compound) return where;
+
+    const { [name]: _nested, ...rest } = where as Row;
+    return { ...rest, ...(compound as Row) };
+  }
+
+  private sameRow(a: Row, b: Row): boolean {
+    return this.primaryKey.every((column) => a[column] === b[column]);
+  }
+
   findMany(args: any = {}): Row[] {
     this.calls.push("findMany");
-    const found = this.rows.filter((row) => matches(row, args.where));
+    const found = this.rows.filter((row) => matches(row, this.where(args.where)));
     const limited = args.take === undefined ? found : found.slice(0, args.take);
     return limited.map((row) => project(row, args.select));
   }
 
   findUnique(args: any): Row | null {
     this.calls.push("findUnique");
-    const row = this.rows.find((candidate) => matches(candidate, args.where));
+    const row = this.rows.find((candidate) => matches(candidate, this.where(args.where)));
     return row ? project(row, args.select) : null;
   }
 
   create(args: any): Row {
     this.calls.push("create");
-    const row: Row = { [this.primaryKey]: this.nextId++, ...args.data };
+    // A single-column key stands in for an autoincrement column; a composite
+    // key is always supplied by the caller, as it is in the database.
+    const generated =
+      this.primaryKey.length === 1 && args.data[this.primaryKey[0] as string] === undefined
+        ? { [this.primaryKey[0] as string]: this.nextId++ }
+        : {};
+    const row: Row = { ...generated, ...args.data };
 
-    if (this.rows.some((existing) => existing[this.primaryKey] === row[this.primaryKey])) {
+    if (this.rows.some((existing) => this.sameRow(existing, row))) {
       throw Object.assign(new Error("Unique constraint failed"), { code: "P2002" });
     }
 
@@ -140,7 +181,7 @@ class FakeTable {
 
   update(args: any): Row {
     this.calls.push("update");
-    const row = this.rows.find((candidate) => matches(candidate, args.where));
+    const row = this.rows.find((candidate) => matches(candidate, this.where(args.where)));
     if (!row) throw new Error(`${this.model}: row not found`);
     Object.assign(row, args.data);
     return project(row, args.select);
@@ -148,7 +189,7 @@ class FakeTable {
 
   updateMany(args: any): { count: number } {
     this.calls.push("updateMany");
-    const found = this.rows.filter((row) => matches(row, args.where));
+    const found = this.rows.filter((row) => matches(row, this.where(args.where)));
     const affected = args.limit === undefined ? found : found.slice(0, args.limit);
     for (const row of affected) Object.assign(row, args.data);
     return { count: affected.length };
@@ -156,7 +197,7 @@ class FakeTable {
 
   delete(args: any): Row {
     this.calls.push("delete");
-    const index = this.rows.findIndex((row) => matches(row, args.where));
+    const index = this.rows.findIndex((row) => matches(row, this.where(args.where)));
     if (index < 0) throw new Error(`${this.model}: row not found`);
     const [row] = this.rows.splice(index, 1) as [Row];
     return project(row, args.select);
@@ -164,7 +205,7 @@ class FakeTable {
 
   deleteMany(args: any): { count: number } {
     this.calls.push("deleteMany");
-    const found = this.rows.filter((row) => matches(row, args.where));
+    const found = this.rows.filter((row) => matches(row, this.where(args.where)));
     const affected = args.limit === undefined ? found : found.slice(0, args.limit);
     this.rows = this.rows.filter((row) => !affected.includes(row));
     return { count: affected.length };
@@ -172,30 +213,37 @@ class FakeTable {
 
   upsert(args: any): Row {
     this.calls.push("upsert");
-    const existing = this.rows.find((row) => matches(row, args.where));
+    const existing = this.rows.find((row) => matches(row, this.where(args.where)));
     return existing
       ? this.update({ where: args.where, data: args.update, select: args.select })
       : this.create({ data: args.create, select: args.select });
   }
 }
 
-/** An audit table: keyed `(revisionId, id)`, so it needs its own where syntax. */
+/**
+ * An audit table: keyed `(revisionId, ...key)`, which Prisma exposes as one
+ * nested `revisionId_orderId_lineNo` argument.
+ */
 class FakeAuditTable {
   rows: Row[] = [];
 
   constructor(
     readonly model: string,
-    readonly primaryKey: string,
+    readonly primaryKey: string[],
   ) {}
+
+  private columns(): string[] {
+    return ["revisionId", ...this.primaryKey];
+  }
+
+  private sameRow(a: Row, b: Row): boolean {
+    return this.columns().every((column) => a[column] === b[column]);
+  }
 
   createMany(args: any): { count: number } {
     const rows = Array.isArray(args.data) ? args.data : [args.data];
     for (const data of rows) {
-      const clash = this.rows.some(
-        (row) =>
-          row.revisionId === data.revisionId && row[this.primaryKey] === data[this.primaryKey],
-      );
-      if (clash) {
+      if (this.rows.some((row) => this.sameRow(row, data))) {
         throw Object.assign(new Error("Unique constraint failed"), { code: "P2002" });
       }
       this.rows.push({ ...data });
@@ -204,12 +252,8 @@ class FakeAuditTable {
   }
 
   update(args: any): Row {
-    const key = args.where[`revisionId_${this.primaryKey}`];
-    const row = this.rows.find(
-      (candidate) =>
-        candidate.revisionId === key.revisionId &&
-        candidate[this.primaryKey] === key[this.primaryKey],
-    );
+    const key = args.where[this.columns().join("_")];
+    const row = this.rows.find((candidate) => this.sameRow(candidate, key));
     if (!row) throw new Error(`${this.model}: audit row not found`);
     Object.assign(row, args.data);
     return row;
@@ -231,8 +275,11 @@ interface Harness {
   client: any;
   product: FakeTable;
   stock: FakeTable;
+  /** A model keyed `@@id([orderId, lineNo])`, for the composite-key paths. */
+  orderLine: FakeTable;
   productAud: FakeAuditTable;
   stockAud: FakeAuditTable;
+  orderLineAud: FakeAuditTable;
   revision: FakeRevisionTable;
   warnings: string[];
 }
@@ -244,10 +291,12 @@ interface Harness {
  * practice.
  */
 function harness(overrides: Partial<AuditOptions> = {}, returning = true): Harness {
-  const product = new FakeTable("Product", "id", returning);
-  const stock = new FakeTable("Stock", "id", returning);
-  const productAud = new FakeAuditTable("ProductAud", "id");
-  const stockAud = new FakeAuditTable("StockAud", "id");
+  const product = new FakeTable("Product", ["id"], returning);
+  const stock = new FakeTable("Stock", ["id"], returning);
+  const orderLine = new FakeTable("OrderLine", ["orderId", "lineNo"], returning);
+  const productAud = new FakeAuditTable("ProductAud", ["id"]);
+  const stockAud = new FakeAuditTable("StockAud", ["id"]);
+  const orderLineAud = new FakeAuditTable("OrderLineAud", ["orderId", "lineNo"]);
   const revision = new FakeRevisionTable();
   const warnings: string[] = [];
 
@@ -265,10 +314,14 @@ function harness(overrides: Partial<AuditOptions> = {}, returning = true): Harne
     revision,
     productAud,
     stockAud,
+    orderLineAud,
   };
 
-  for (const table of [product, stock]) {
-    client[table.model.toLowerCase()] = new Proxy(
+  for (const table of [product, stock, orderLine]) {
+    // Prisma lower-cases only the first character: `OrderLine` -> `orderLine`.
+    const delegate = table.model.charAt(0).toLowerCase() + table.model.slice(1);
+
+    client[delegate] = new Proxy(
       {},
       {
         get: (_target, property) => {
@@ -290,7 +343,17 @@ function harness(overrides: Partial<AuditOptions> = {}, returning = true): Harne
 
   box.client = client;
 
-  return { client, product, stock, productAud, stockAud, revision, warnings };
+  return {
+    client,
+    product,
+    stock,
+    orderLine,
+    productAud,
+    stockAud,
+    orderLineAud,
+    revision,
+    warnings,
+  };
 }
 
 /** Run a block as if it were inside `$auditTransaction`. */
@@ -458,6 +521,105 @@ describe("bulk writes", () => {
 
     assert.equal(h.stockAud.rows.length, 1);
     assert.equal(h.productAud.rows.length, 0);
+  });
+});
+
+describe("composite primary keys", () => {
+  it("audits every row an updateMany touched, key columns and all", async () => {
+    const h = harness();
+    h.orderLine.rows.push(
+      { orderId: 1, lineNo: 1, quantity: 5 },
+      { orderId: 1, lineNo: 2, quantity: 5 },
+      { orderId: 2, lineNo: 1, quantity: 9 },
+    );
+
+    const result = await inRevision(h, () =>
+      h.client.orderLine.updateMany({ where: { orderId: 1 }, data: { quantity: 7 } }),
+    );
+
+    assert.deepEqual(result, { count: 2 });
+    assert.deepEqual(h.orderLineAud.rows, [
+      { revisionId: 1n, revType: "UPDATE", orderId: 1, lineNo: 1, quantity: 7 },
+      { revisionId: 1n, revType: "UPDATE", orderId: 1, lineNo: 2, quantity: 7 },
+    ]);
+  });
+
+  it("reads a limited bulk write back by naming each key in full", async () => {
+    const h = harness();
+    h.orderLine.rows.push(
+      { orderId: 1, lineNo: 1, quantity: 5 },
+      { orderId: 1, lineNo: 2, quantity: 5 },
+      { orderId: 1, lineNo: 3, quantity: 5 },
+    );
+
+    const result = await inRevision(h, () =>
+      h.client.orderLine.deleteMany({ where: { orderId: 1 }, limit: 2 }),
+    );
+
+    assert.deepEqual(result, { count: 2 });
+    assert.equal(h.orderLine.rows.length, 1);
+    assert.deepEqual(
+      h.orderLineAud.rows.map((row) => [row.orderId, row.lineNo, row.revType]),
+      [
+        [1, 1, "DELETE"],
+        [1, 2, "DELETE"],
+      ],
+    );
+  });
+
+  it("re-reads a row narrowed by select through its compound key", async () => {
+    const h = harness();
+    h.orderLine.rows.push({ orderId: 1, lineNo: 1, quantity: 5 });
+
+    const updated = await inRevision(h, () =>
+      h.client.orderLine.update({
+        where: { orderId_lineNo: { orderId: 1, lineNo: 1 } },
+        data: { quantity: 8 },
+        select: { quantity: true },
+      }),
+    );
+
+    // The caller asked for one column, so the audit row was filled from a re-read.
+    assert.deepEqual(updated, { quantity: 8 });
+    assert.deepEqual(h.orderLineAud.rows, [
+      { revisionId: 1n, revType: "UPDATE", orderId: 1, lineNo: 1, quantity: 8 },
+    ]);
+  });
+
+  it("keeps one audit row for a key touched twice in a revision", async () => {
+    const h = harness();
+    h.orderLine.rows.push({ orderId: 1, lineNo: 1, quantity: 5 });
+
+    await inRevision(h, async () => {
+      await h.client.orderLine.update({
+        where: { orderId_lineNo: { orderId: 1, lineNo: 1 } },
+        data: { quantity: 6 },
+      });
+      await h.client.orderLine.updateMany({ where: { orderId: 1 }, data: { quantity: 7 } });
+    });
+
+    assert.equal(h.orderLineAud.rows.length, 1);
+    assert.equal(h.orderLineAud.rows[0]?.quantity, 7);
+  });
+
+  it("tells two rows apart when one key column matches and the other does not", async () => {
+    const h = harness();
+
+    await inRevision(h, () =>
+      h.client.orderLine.createMany({
+        data: [
+          { orderId: 1, lineNo: 1, quantity: 5 },
+          { orderId: 1, lineNo: 2, quantity: 5 },
+        ],
+      }),
+    );
+
+    assert.equal(h.orderLineAud.rows.length, 2);
+    assert.deepEqual(
+      h.orderLineAud.rows.map((row) => row.lineNo),
+      [1, 2],
+    );
+    assert.ok(h.orderLineAud.rows.every((row) => row.revType === "INSERT"));
   });
 });
 

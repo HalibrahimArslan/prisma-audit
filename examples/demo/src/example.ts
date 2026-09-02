@@ -61,6 +61,7 @@ async function main(): Promise<void> {
 
   await report(product.id);
   await bulk(category.id);
+  await composite();
 }
 
 /**
@@ -107,7 +108,7 @@ async function bulk(categoryId: number): Promise<void> {
   console.log("\n── Bulk writes ─────────────────────────────────────────────");
   for (const revision of (await prisma.audit.revisions(4)).reverse()) {
     const changes = revision.changes
-      .map((change) => `${change.model}#${String(change.id)} ${change.revType}`)
+      .map((change) => `${change.model}#${formatKey(change.id)} ${change.revType}`)
       .join(", ");
     console.log(`  rev ${String(revision.id).padStart(3)}  ${revision.username ?? "-"}  ${changes}`);
   }
@@ -122,6 +123,68 @@ async function bulk(categoryId: number): Promise<void> {
       `  rev ${String(entry.revisionId).padStart(3)}  ${entry.revType.padEnd(6)}  price=${String(entity.price)}`,
     );
   }
+}
+
+/**
+ * A model whose primary key spans two columns. Nothing about the call sites
+ * changes; the audit table is keyed on `(revisionId, orderId, lineNo)` and the
+ * reader is given the whole key.
+ */
+async function composite(): Promise<void> {
+  await prisma.$auditTransaction(halil, async (tx) => {
+    await tx.orderLine.createMany({
+      data: [
+        { orderId: 1, lineNo: 1, quantity: 2 },
+        { orderId: 1, lineNo: 2, quantity: 5 },
+        { orderId: 2, lineNo: 1, quantity: 1 },
+      ],
+    });
+  });
+
+  // A bulk write over one order: two of the three rows, each audited under its
+  // own two-column key.
+  await prisma.$auditTransaction(ahmet, async (tx) => {
+    await tx.orderLine.updateMany({ where: { orderId: 1 }, data: { quantity: 9 } });
+  });
+
+  await prisma.$auditTransaction(halil, async (tx) => {
+    await tx.orderLine.update({
+      where: { orderId_lineNo: { orderId: 1, lineNo: 2 } },
+      data: { note: "gift wrap" },
+    });
+  });
+
+  const history = await prisma.audit
+    .for("OrderLine")
+    .id({ orderId: 1, lineNo: 2 })
+    .getRevisions();
+
+  console.log("\n── Composite key: history of order 1, line 2 ───────────────");
+  for (const entry of history) {
+    const entity = entry.entity as Record<string, unknown>;
+    console.log(
+      `  rev ${String(entry.revisionId).padStart(3)}  ${entry.revType.padEnd(6)}` +
+        `  by ${(entry.user.username ?? "-").padEnd(6)}` +
+        `  quantity=${String(entity.quantity)} note=${String(entity.note)}`,
+    );
+  }
+
+  console.log("\n── Composite key: what each revision touched ───────────────");
+  for (const revision of (await prisma.audit.revisions(3)).reverse()) {
+    const changes = revision.changes
+      .map((change) => `${change.model}(${formatKey(change.id)}) ${change.revType}`)
+      .join(", ");
+    console.log(`  rev ${String(revision.id).padStart(3)}  ${revision.username ?? "-"}  ${changes}`);
+  }
+}
+
+/** A change reports its key as the value itself, or as a column-per-value object. */
+function formatKey(id: unknown): string {
+  if (id === null || typeof id !== "object") return String(id);
+
+  return Object.entries(id)
+    .map(([column, value]) => `${column}=${String(value)}`)
+    .join(", ");
 }
 
 async function report(productId: number): Promise<void> {
@@ -178,7 +241,7 @@ async function report(productId: number): Promise<void> {
   console.log("\n── Revisions ───────────────────────────────────────────────");
   for (const revision of (await prisma.audit.revisions()).reverse()) {
     const changes = revision.changes
-      .map((change) => `${change.model}#${String(change.id)} ${change.revType}`)
+      .map((change) => `${change.model}#${formatKey(change.id)} ${change.revType}`)
       .join(", ");
     console.log(
       `  rev ${String(revision.id).padStart(3)}  ${revision.username ?? "-"}  ${changes || "(no audited change)"}`,
@@ -195,7 +258,7 @@ function summarise(entity: unknown): string {
 /** Start from a clean slate so the demo can be run repeatedly. */
 async function reset(): Promise<void> {
   await prisma.$executeRawUnsafe(
-    'TRUNCATE TABLE "product_aud", "stock_aud", "revision", "Stock", "Product", "Category" RESTART IDENTITY CASCADE',
+    'TRUNCATE TABLE "product_aud", "stock_aud", "order_line_aud", "revision", "Stock", "Product", "OrderLine", "Category" RESTART IDENTITY CASCADE',
   );
 }
 

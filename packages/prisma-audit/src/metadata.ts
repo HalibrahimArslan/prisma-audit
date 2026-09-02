@@ -62,15 +62,32 @@ export interface AuditModel {
   delegate: string;
   /** Prisma Client delegate for the audit model, e.g. `productAud`. */
   auditDelegate: string;
-  /** Single-column primary key name. `null` when the model has none. */
-  primaryKey: string | null;
+  /**
+   * The columns that form the primary key, in key order: one entry for a field
+   * marked `@id`, several for `@@id([a, b])`, and none when the model has no
+   * primary key at all.
+   */
+  primaryKey: string[];
+  /**
+   * The name Prisma Client gives the compound key argument of a composite key,
+   * i.e. the `name:` of `@@id([a, b], name: "...")`. Absent when the key is a
+   * single column, or when Prisma's default name (`a_b`) applies.
+   */
+  primaryKeyName?: string;
   fields: AuditField[];
   line: number;
 }
 
+/** The metadata format this build of prisma-audit writes and reads. */
+export const METADATA_VERSION = 2;
+
 export interface AuditMetadata {
-  /** Metadata format version, bumped when the shape changes. */
-  version: 1;
+  /**
+   * Metadata format version, bumped when the shape changes. Version 2 turned
+   * `AuditModel.primaryKey` from a single column name into the list of columns
+   * that form the key; `loadMetadata` upgrades a version 1 file in memory.
+   */
+  version: number;
   /** Every model found in the schema, audited or not. */
   models: AuditModel[];
   /** Enum names declared in the schema; used to tell enums from relations. */

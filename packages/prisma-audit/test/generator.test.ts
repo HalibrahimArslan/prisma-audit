@@ -116,6 +116,29 @@ describe("generator", () => {
     assert.match(block(output, "ProductAud"), /onDelete: Cascade/);
   });
 
+  it("keys an audit table on every column of a composite primary key", () => {
+    const { metadata: composite } = parseSchemaText(
+      `[Auditable]
+model OrderLine {
+  orderId  Int
+  lineNo   Int
+  quantity Int
+
+  @@id([orderId, lineNo], name: "line")
+}
+`,
+    );
+
+    const audit = block(generateAuditSchema(composite), "OrderLineAud");
+
+    assert.match(audit, /@@id\(\[revisionId, orderId, lineNo\]\)/);
+    assert.match(audit, /@@index\(\[orderId, lineNo, revisionId\]\)/);
+    // Both key columns stay required; only the rest of the row is optional.
+    assert.match(audit, /^\s+orderId\s+Int$/m);
+    assert.match(audit, /^\s+lineNo\s+Int$/m);
+    assert.match(audit, /quantity\s+Int\?/);
+  });
+
   it("produces nothing but the revision scaffolding when no model is annotated", () => {
     const { metadata: empty } = parseSchemaText("model A {\n  id Int @id\n}\n");
     const emptyOutput = generateAuditSchema(empty);

@@ -1,4 +1,5 @@
 import { auditedFields, type AuditModel } from "../metadata.js";
+import { isComposite, keyOf, type EntityKey } from "../util/keys.js";
 
 export type RevisionType = "INSERT" | "UPDATE" | "DELETE";
 
@@ -31,16 +32,23 @@ type AnyClient = any;
  *     await prisma.audit.for("Product").id(10).atRevision(120n);
  */
 export class AuditQuery<T = Record<string, unknown>> {
-  private idValue: unknown;
+  private key: EntityKey | undefined;
 
   constructor(
     private readonly client: AnyClient,
     private readonly model: AuditModel,
   ) {}
 
-  /** Restrict the query to one row of the source model. */
+  /**
+   * Restrict the query to one row of the source model.
+   *
+   * A single-column key is given as the value itself; a composite key as an
+   * object naming every column, `id({ orderId: 1, lineNo: 2 })`. Both forms are
+   * exactly what `AuditReader.revisions()` reports for a change, so a summary
+   * can be handed straight back to `.id()`.
+   */
   id(value: unknown): this {
-    this.idValue = value;
+    this.key = this.toKey(value);
     return this;
   }
 
@@ -125,12 +133,31 @@ export class AuditQuery<T = Record<string, unknown>> {
   }
 
   private whereId(): Record<string, unknown> {
-    if (this.idValue === undefined) {
-      throw new Error(
-        `Call .id(...) before querying the history of ${this.model.name}.`,
-      );
+    if (!this.key) {
+      throw new Error(`Call .id(...) before querying the history of ${this.model.name}.`);
     }
-    return { [this.model.primaryKey as string]: this.idValue };
+    // The audit table carries the key columns as ordinary columns, so they
+    // filter flatly here even when the source model's key is composite.
+    return { ...this.key };
+  }
+
+  /** Read the argument of `.id()` as a full key, or explain what is missing. */
+  private toKey(value: unknown): EntityKey {
+    const columns = this.model.primaryKey;
+    const fromObject = keyOf(this.model, value);
+
+    if (fromObject) return fromObject;
+
+    // A single-column key is normally passed as the bare value — which may
+    // itself be an object, e.g. a `DateTime` or a `Bytes` key.
+    if (!isComposite(this.model) && value !== undefined) {
+      return { [columns[0] as string]: value };
+    }
+
+    throw new Error(
+      `${this.model.name} has a composite primary key, so .id() needs every column: ` +
+        `.id({ ${columns.map((column) => `${column}: …`).join(", ")} })`,
+    );
   }
 
   /** Split a raw audit row into revision bookkeeping and entity state. */

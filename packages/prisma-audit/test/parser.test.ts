@@ -64,7 +64,7 @@ describe("parser", () => {
   });
 
   it("finds the single-column primary key", () => {
-    assert.equal(product?.primaryKey, "id");
+    assert.deepEqual(product?.primaryKey, ["id"]);
     assert.equal(field("id")?.isId, true);
   });
 
@@ -129,13 +129,56 @@ describe("parser", () => {
     );
   });
 
-  it("rejects a composite primary key with a specific message", () => {
+  it("reads a composite primary key in the order @@id gives it", () => {
+    const { metadata } = parseSchemaText(
+      "[Auditable]\nmodel A {\n  b Int\n  a Int\n  @@id([a, b])\n}\n",
+    );
+
+    assert.deepEqual(metadata.models[0]?.primaryKey, ["a", "b"]);
+    assert.equal(metadata.models[0]?.primaryKeyName, undefined);
+  });
+
+  it("keeps the name @@id gives a composite key, and drops column modifiers", () => {
+    const { metadata } = parseSchemaText(
+      '[Auditable]\nmodel A {\n  a String\n  b Int\n  @@id([a(length: 100), b], name: "ab")\n}\n',
+    );
+
+    assert.deepEqual(metadata.models[0]?.primaryKey, ["a", "b"]);
+    assert.equal(metadata.models[0]?.primaryKeyName, "ab");
+  });
+
+  it("lets @@id override a field-level @id wherever it is written", () => {
+    const { metadata } = parseSchemaText(
+      "[Auditable]\nmodel A {\n  a Int @id\n  b Int\n  @@id([a, b])\n}\n",
+    );
+
+    assert.deepEqual(metadata.models[0]?.primaryKey, ["a", "b"]);
+  });
+
+  it("rejects a composite key naming a field the model does not have", () => {
+    assert.throws(
+      () => parseSchemaText("[Auditable]\nmodel A {\n  a Int\n  @@id([a, b])\n}\n"),
+      /no field "b"/,
+    );
+  });
+
+  it("rejects a composite key that includes a relation field", () => {
     assert.throws(
       () =>
         parseSchemaText(
-          "[Auditable]\nmodel A {\n  a Int\n  b Int\n  @@id([a, b])\n}\n",
+          "[Auditable]\nmodel A {\n  bId Int\n  b B @relation(fields: [bId], references: [id])\n  @@id([bId, b])\n}\nmodel B {\n  id Int @id\n}\n",
         ),
-      /composite @@id/,
+      /relation field/,
+    );
+  });
+
+  it("rejects [NotAudited] on part of a composite key", () => {
+    assert.throws(
+      () =>
+        parseSchemaText(
+          "[Auditable]\nmodel A {\n  a Int\n  [NotAudited]\n  b Int\n  @@id([a, b])\n}\n",
+        ),
+      /cannot be \[NotAudited\]/,
     );
   });
 

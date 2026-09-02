@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 
 import {
+  METADATA_VERSION,
   PRISMA_SCALARS,
   type AuditField,
   type AuditFieldKind,
@@ -43,12 +44,12 @@ const BLOCK_START =
 const FIELD =
   /^\s*([A-Za-z_][A-Za-z0-9_]*)\s+([A-Za-z_][A-Za-z0-9_]*)(\[\])?(\?)?\s*(.*)$/;
 const PROVIDER = /^\s*provider\s*=\s*"([^"]+)"/;
+/** `@@id([orderId, lineNo], name: "orderLine")`, with the argument list captured. */
+const BLOCK_ID = /^\s*@@id\s*\(\s*\[([^\]]*)\]\s*(?:,([^)]*))?\)/;
+const KEY_NAME = /\bname\s*:\s*"([^"]+)"/;
 
 /** Field names the generator reserves on every audit model. */
 export const RESERVED_AUDIT_FIELDS = ["revisionId", "revision", "revType"];
-
-/** Sentinel stored in `primaryKey` when the model uses `@@id([...])`. */
-const COMPOSITE_KEY = " composite";
 
 export function parseSchemaText(source: string): ParseResult {
   const lines = source.split(/\r?\n/);
@@ -63,6 +64,8 @@ export function parseSchemaText(source: string): ParseResult {
   let currentBlock: string | null = null;
   /** The `datasource` provider, which decides some runtime strategies. */
   let provider: string | undefined;
+  /** Where each model's `@@id([...])` sits, so key errors can point at it. */
+  const keyLines = new Map<string, number>();
 
   const failPending = () => {
     if (pending) {
@@ -117,7 +120,7 @@ export function parseSchemaText(source: string): ParseResult {
           auditTableName: `${toSnakeCase(name)}_aud`,
           delegate: toDelegateName(name),
           auditDelegate: toDelegateName(`${name}Aud`),
-          primaryKey: null,
+          primaryKey: [],
           fields: [],
           line: lineNumber,
         };
@@ -144,7 +147,7 @@ export function parseSchemaText(source: string): ParseResult {
     }
 
     if (currentBlock === "model" && currentModel) {
-      parseModelLine(currentModel, line, lineNumber, pending);
+      parseModelLine(currentModel, line, lineNumber, pending, keyLines);
       pending = null;
     } else if (currentBlock === "datasource") {
       const match = PROVIDER.exec(line);
@@ -161,10 +164,10 @@ export function parseSchemaText(source: string): ParseResult {
 
   failPending();
 
-  const metadata: AuditMetadata = { version: 1, models, enums };
+  const metadata: AuditMetadata = { version: METADATA_VERSION, models, enums };
   if (provider) metadata.provider = provider;
   resolveFieldKinds(metadata);
-  validate(metadata);
+  validate(metadata, keyLines);
 
   return { cleanSchema: clean.join("\n"), metadata, warnings };
 }
@@ -174,6 +177,7 @@ function parseModelLine(
   line: string,
   lineNumber: number,
   pending: { name: string; line: number } | null,
+  keyLines: Map<string, number>,
 ): void {
   const trimmed = line.trim();
 
@@ -185,9 +189,16 @@ function parseModelLine(
         pending.line,
       );
     }
-    if (trimmed.startsWith("@@id")) {
-      // Recorded so validate() can produce a precise "composite key" error.
-      model.primaryKey = COMPOSITE_KEY;
+    const blockId = BLOCK_ID.exec(trimmed);
+    if (blockId) {
+      // `@@id` wins over a field-level `@id`, which Prisma does not allow
+      // alongside it anyway, and it fixes the order the key columns are in.
+      model.primaryKey = keyColumns(blockId[1] as string);
+
+      const name = KEY_NAME.exec(blockId[2] ?? "");
+      if (name) model.primaryKeyName = name[1] as string;
+
+      keyLines.set(model.name, lineNumber);
     }
     return;
   }
@@ -226,9 +237,24 @@ function parseModelLine(
 
   if (excludedByAnnotation) field.excludedBy = "annotation";
 
-  if (isId && model.primaryKey !== COMPOSITE_KEY) model.primaryKey = name;
+  // A field-level `@id` only counts while no `@@id([...])` has been seen; the
+  // block attribute may also come after the fields it names.
+  if (isId && !keyLines.has(model.name)) model.primaryKey = [name];
 
   model.fields.push(field);
+}
+
+/**
+ * The column names inside `@@id([...])`, in the order they form the key.
+ *
+ * Prisma allows a per-column modifier — `@@id([title(length: 100), author])` —
+ * which names the same column and is dropped here.
+ */
+function keyColumns(list: string): string[] {
+  return list
+    .split(",")
+    .map((entry) => (entry.split("(")[0] as string).trim())
+    .filter((entry) => entry.length > 0);
 }
 
 /**
@@ -262,31 +288,21 @@ function resolveFieldKinds(metadata: AuditMetadata): void {
   }
 }
 
-function validate(metadata: AuditMetadata): void {
+function validate(metadata: AuditMetadata, keyLines: Map<string, number>): void {
   for (const model of metadata.models) {
     if (!model.auditable) continue;
 
-    if (model.primaryKey === COMPOSITE_KEY) {
-      model.primaryKey = null;
+    const keyLine = keyLines.get(model.name) ?? model.line;
+
+    if (model.primaryKey.length === 0) {
       throw new AuditSchemaError(
-        `Model ${model.name} uses a composite @@id, which prisma-audit does not support yet. Remove [Auditable] or give the model a single @id field`,
+        `Model ${model.name} is [Auditable] but has no primary key. Mark a field @id, or give the model @@id([...])`,
         model.line,
       );
     }
 
-    if (!model.primaryKey) {
-      throw new AuditSchemaError(
-        `Model ${model.name} is [Auditable] but has no single-column @id field`,
-        model.line,
-      );
-    }
-
-    const primaryKey = model.fields.find((field) => field.name === model.primaryKey);
-    if (primaryKey && !primaryKey.audited) {
-      throw new AuditSchemaError(
-        `The primary key ${model.name}.${primaryKey.name} cannot be [NotAudited]`,
-        primaryKey.line,
-      );
+    for (const column of model.primaryKey) {
+      validateKeyColumn(model, column, keyLine);
     }
 
     for (const field of model.fields) {
@@ -298,6 +314,41 @@ function validate(metadata: AuditMetadata): void {
       }
     }
   }
+}
+
+/**
+ * Every key column ends up in the audit table's own `@@id([revisionId, ...])`,
+ * so a key the audit table cannot hold is rejected at generate time rather than
+ * producing a schema Prisma refuses.
+ */
+function validateKeyColumn(model: AuditModel, column: string, keyLine: number): void {
+  const field = model.fields.find((candidate) => candidate.name === column);
+
+  if (!field) {
+    throw new AuditSchemaError(
+      `Model ${model.name} has no field "${column}" to use as part of its primary key`,
+      keyLine,
+    );
+  }
+
+  if (field.audited) return;
+
+  if (field.excludedBy === "annotation") {
+    throw new AuditSchemaError(
+      `The primary key ${model.name}.${field.name} cannot be [NotAudited]`,
+      field.line,
+    );
+  }
+
+  const reason =
+    field.excludedBy === "relation"
+      ? "is a relation field; put the scalar foreign key in the key instead"
+      : "is a list column, which an audit table cannot key on";
+
+  throw new AuditSchemaError(
+    `${model.name}.${field.name} is part of the primary key but ${reason}`,
+    field.line,
+  );
 }
 
 export async function parseSchemaFile(schemaPath: string): Promise<ParseResult> {

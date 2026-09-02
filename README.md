@@ -101,8 +101,8 @@ single indexed lookup, and `diff()` is computed on read.
 
 **The primary key stays required, everything else is optional.** Audit columns
 are nullable so that a column added to the model later does not invalidate
-revisions recorded before it existed. The key cannot be, because it is part of
-`@@id([revisionId, id])`.
+revisions recorded before it existed. The key columns cannot be, because they
+are part of `@@id([revisionId, …])`.
 
 **Writes that bypass Prisma are not audited.** A raw `UPDATE product SET ...`
 leaves no trace. Database triggers are the answer for that, and are on the
@@ -232,9 +232,63 @@ isolation level if that matters.
 
 ---
 
+## Composite primary keys
+
+A model keyed on more than one column is audited like any other; the audit table
+simply carries every key column, and the whole key is what identifies a row.
+
+```prisma
+[Auditable]
+model OrderLine {
+  orderId  Int
+  lineNo   Int
+  quantity Int
+
+  @@id([orderId, lineNo])
+}
+```
+
+```prisma
+// generated
+model OrderLineAud {
+  revisionId BigInt
+  revType    RevisionType
+
+  orderId  Int
+  lineNo   Int
+  quantity Int?
+
+  @@id([revisionId, orderId, lineNo])
+  @@index([orderId, lineNo, revisionId])
+}
+```
+
+The reader takes the key as an object:
+
+```ts
+await prisma.audit.for("OrderLine").id({ orderId: 1, lineNo: 2 }).getRevisions();
+```
+
+which is exactly the shape `revisions()` reports for a change, so a summary can
+be handed straight back:
+
+```ts
+for (const change of (await prisma.audit.revisions()).flatMap((r) => r.changes)) {
+  await prisma.audit.for(change.model).id(change.id).getRevisions();
+}
+```
+
+A single-column key still reads as the value itself — `.id(10)` — and reports as
+`change.id === 10`.
+
+Bulk writes cost slightly more on a composite key: there is no `IN (...)` form
+for a multi-column key, so the rows are read back as a list of alternatives
+(`WHERE (orderId, lineNo) = … OR …`), which the primary key index still serves.
+
+---
+
 ## Current limitations
 
-Composite primary keys are rejected at generate time with a clear message.
 Nested writes (`product.update({ data: { stocks: { create: … } } })`) are audited
 only for the top-level model; when the nested model is `[Auditable]`, prisma-audit
 warns once per relation instead of leaving a silent gap. List columns and relation

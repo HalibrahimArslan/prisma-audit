@@ -45,6 +45,18 @@ model Stock {
   quantity  Int
 }
 
+// A model keyed by two columns. The audit table is keyed the same way, on
+// @@id([revisionId, orderId, lineNo]), and the reader takes the whole key.
+[Auditable]
+model OrderLine {
+  orderId  Int
+  lineNo   Int
+  quantity Int
+  note     String?
+
+  @@id([orderId, lineNo])
+}
+
 // Not annotated: writes to Category leave no audit trail.
 model Category {
   id       Int       @id @default(autoincrement())

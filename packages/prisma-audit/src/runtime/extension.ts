@@ -4,6 +4,17 @@ import {
   type AuditModel,
 } from "../metadata.js";
 import {
+  batchSize,
+  keyFromWhere,
+  keyIdentity,
+  keyOf,
+  keySelect,
+  whereAnyOf,
+  whereAuditRow,
+  whereUnique,
+  type EntityKey,
+} from "../util/keys.js";
+import {
   getAuditContext,
   runWithAuditContext,
   type AuditContext,
@@ -284,10 +295,9 @@ async function rowExists(
   model: AuditModel,
   where: any,
 ): Promise<boolean> {
-  const primaryKey = model.primaryKey as string;
   const row = await client[model.delegate].findUnique({
     where,
-    select: { [primaryKey]: true },
+    select: keySelect(model),
   });
   return row !== null && row !== undefined;
 }
@@ -318,17 +328,15 @@ async function resolveState(
     );
   }
 
-  const primaryKey = model.primaryKey as string;
-  const id = result?.[primaryKey] ?? args?.where?.[primaryKey];
+  // The narrowed result may still carry the key; failing that, a single-row
+  // write always names the row it targets in its own `where`.
+  const key = keyOf(model, result) ?? keyFromWhere(model, args?.where);
 
-  if (id === undefined) {
-    throw new Error(
-      `${model.name}.${operation}() uses select/omit without returning ${primaryKey}, ` +
-        `so prisma-audit cannot re-read the row. Include ${primaryKey} in the selection.`,
-    );
-  }
+  if (!key) throw new Error(missingKeyForReread(model, `${model.name}.${operation}()`, "row"));
 
-  return (await client[model.delegate].findUnique({ where: { [primaryKey]: id } })) ?? {};
+  return (
+    (await client[model.delegate].findUnique({ where: whereUnique(model, key) })) ?? {}
+  );
 }
 
 /* -------------------------------------------------------------------------- */
@@ -445,25 +453,24 @@ async function updateManyAudited(
   args: any,
   query: (args: any) => Promise<any>,
 ): Promise<Outcome> {
-  const primaryKey = model.primaryKey as string;
   const limited = args?.limit !== undefined;
 
   const targets: any[] = await client[model.delegate].findMany({
     where: args?.where,
-    select: { [primaryKey]: true },
+    select: keySelect(model),
     ...(limited ? { take: args.limit } : {}),
   });
 
-  const ids = targets.map((row) => row[primaryKey]);
+  const keys = targets.map((row) => keyOf(model, row) as EntityKey);
 
   // With `limit` the database decides which of the matching rows to touch, and
-  // that need not be the set just read. Re-issuing the update against those ids
-  // makes the two statements agree instead of hoping that they do.
+  // that need not be the set just read. Re-issuing the update against those
+  // keys makes the two statements agree instead of hoping that they do.
   const result = limited
-    ? await runBypassed(client, model, "updateMany", withIdFilter(args, primaryKey, ids))
+    ? await runBypassed(client, model, "updateMany", withKeyFilter(args, model, keys))
     : await query(args);
 
-  const states = await readByIds(client, model, ids);
+  const states = await readByKeys(client, model, keys);
 
   return { result, entries: states.map((state) => ({ state, revType: "UPDATE" })) };
 }
@@ -474,7 +481,6 @@ async function deleteManyAudited(
   args: any,
   query: (args: any) => Promise<any>,
 ): Promise<Outcome> {
-  const primaryKey = model.primaryKey as string;
   const limited = args?.limit !== undefined;
 
   // Read the whole row, not just the key: after the delete there is nothing
@@ -489,10 +495,10 @@ async function deleteManyAudited(
         client,
         model,
         "deleteMany",
-        withIdFilter(
+        withKeyFilter(
           args,
-          primaryKey,
-          doomed.map((row) => row[primaryKey]),
+          model,
+          doomed.map((row) => keyOf(model, row) as EntityKey),
         ),
       )
     : await query(args);
@@ -501,9 +507,9 @@ async function deleteManyAudited(
 }
 
 /** The same arguments, narrowed to a fixed set of rows and without `limit`. */
-function withIdFilter(args: any, primaryKey: string, ids: unknown[]): any {
+function withKeyFilter(args: any, model: AuditModel, keys: EntityKey[]): any {
   const { limit: _limit, where: _where, ...rest } = args ?? {};
-  return { ...rest, where: { [primaryKey]: { in: ids } } };
+  return { ...rest, where: whereAnyOf(model, keys) };
 }
 
 /**
@@ -519,33 +525,35 @@ async function hydrate(
 ): Promise<Record<string, unknown>[]> {
   if (!usesProjection(args)) return rows ?? [];
 
-  const primaryKey = model.primaryKey as string;
-  const ids = (rows ?? []).map((row) => row?.[primaryKey]);
+  const keys = (rows ?? []).map((row) => keyOf(model, row));
 
-  if (ids.some((id) => id === undefined)) {
-    throw new Error(
-      `${model.name}.${operation}() uses select/omit without returning ${primaryKey}, ` +
-        `so prisma-audit cannot re-read the rows. Include ${primaryKey} in the selection.`,
-    );
+  if (keys.some((key) => key === null)) {
+    throw new Error(missingKeyForReread(model, `${model.name}.${operation}()`, "rows"));
   }
 
-  return readByIds(client, model, ids);
+  return readByKeys(client, model, keys as EntityKey[]);
 }
 
-async function readByIds(
+/** The one message both re-read paths need, naming every column of the key. */
+function missingKeyForReread(model: AuditModel, call: string, rows: string): string {
+  const columns = model.primaryKey.join(", ");
+  return (
+    `${call} uses select/omit without returning ${columns}, so prisma-audit cannot ` +
+    `re-read the ${rows}. Include ${columns} in the selection.`
+  );
+}
+
+async function readByKeys(
   client: AnyClient,
   model: AuditModel,
-  ids: unknown[],
+  keys: EntityKey[],
 ): Promise<Record<string, unknown>[]> {
-  if (ids.length === 0) return [];
+  if (keys.length === 0) return [];
 
-  const primaryKey = model.primaryKey as string;
   const rows: Record<string, unknown>[] = [];
 
-  for (const chunk of chunks(ids)) {
-    rows.push(
-      ...(await client[model.delegate].findMany({ where: { [primaryKey]: { in: chunk } } })),
-    );
+  for (const chunk of chunks(keys, batchSize(model, CHUNK_SIZE))) {
+    rows.push(...(await client[model.delegate].findMany({ where: whereAnyOf(model, chunk) })));
   }
 
   return rows;
@@ -576,9 +584,9 @@ function isUniqueViolation(error: unknown): boolean {
   return (error as { code?: string } | null)?.code === UNIQUE_VIOLATION;
 }
 
-function* chunks<T>(items: T[]): Generator<T[]> {
-  for (let index = 0; index < items.length; index += CHUNK_SIZE) {
-    yield items.slice(index, index + CHUNK_SIZE);
+function* chunks<T>(items: T[], size: number): Generator<T[]> {
+  for (let index = 0; index < items.length; index += size) {
+    yield items.slice(index, index + size);
   }
 }
 
@@ -603,7 +611,6 @@ async function writeAuditRows(
 ): Promise<void> {
   if (entries.length === 0) return;
 
-  const primaryKey = model.primaryKey as string;
   const revisionId = context.revisionId as bigint;
   const written = (context.written ??= new Map());
 
@@ -611,16 +618,17 @@ async function writeAuditRows(
   const pending = new Map<string, Record<string, unknown>>();
 
   for (const entry of entries) {
-    const id = entry.state[primaryKey];
+    const key = keyOf(model, entry.state);
 
-    if (id === undefined) {
+    if (!key) {
       throw new Error(
-        `${model.name}: an audited write produced a row without ${primaryKey}, so it cannot be recorded.`,
+        `${model.name}: an audited write produced a row without ${model.primaryKey.join(", ")}, ` +
+          `so it cannot be recorded.`,
       );
     }
 
-    const key = `${model.name}#${String(id)}`;
-    const previous = written.get(key);
+    const identity = `${model.name}#${keyIdentity(model, key)}`;
+    const previous = written.get(identity);
     const revType =
       previous === "INSERT" && entry.revType === "UPDATE" ? "INSERT" : entry.revType;
 
@@ -630,19 +638,19 @@ async function writeAuditRows(
       ...pickAuditedFields(model, entry.state),
     };
 
-    if (previous === undefined || pending.has(key)) {
-      pending.set(key, data);
+    if (previous === undefined || pending.has(identity)) {
+      pending.set(identity, data);
     } else {
       await client[model.auditDelegate].update({
-        where: { [`revisionId_${primaryKey}`]: { revisionId, [primaryKey]: id } },
+        where: whereAuditRow(model, revisionId, key),
         data,
       });
     }
 
-    written.set(key, revType);
+    written.set(identity, revType);
   }
 
-  for (const chunk of chunks([...pending.values()])) {
+  for (const chunk of chunks([...pending.values()], batchSize(model, CHUNK_SIZE))) {
     await client[model.auditDelegate].createMany({ data: chunk });
   }
 }
