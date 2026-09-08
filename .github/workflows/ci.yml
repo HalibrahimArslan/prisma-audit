@@ -1,0 +1,105 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A second push to the same branch makes the first one's run pointless.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit:
+    name: Unit tests (node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # The floor the package declares, and the current release. The runtime
+        # leans on AsyncLocalStorage and the test suite on node:test, so the
+        # floor is worth holding to rather than assuming.
+        node: ["20", "24"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Reads the version out of packageManager in package.json.
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      # The published build, type-checked as it is packed rather than as it is
+      # tested: tsconfig.build.json is the one npm sees.
+      - run: pnpm build
+
+      - run: pnpm test
+
+  demo:
+    name: End-to-end against PostgreSQL
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: audit
+          POSTGRES_PASSWORD: audit
+          POSTGRES_DB: audit
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U audit -d audit"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+
+    env:
+      # examples/demo/.env names the port docker-compose publishes locally.
+      # process.loadEnvFile leaves a variable that is already set alone, so
+      # this wins over the committed file without either having to change.
+      DATABASE_URL: postgresql://audit:audit@localhost:5432/audit?schema=public
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      # The demo resolves prisma-audit to the workspace package's dist.
+      - run: pnpm build
+
+      - name: Preprocess the annotated schema
+        run: pnpm --filter demo audit:generate
+
+      # deploy, not dev: CI applies the committed migrations, including the
+      # hand-written trigger SQL appended to one of them, and fails on drift
+      # rather than writing a migration of its own.
+      - name: Apply migrations
+        run: pnpm --filter demo exec prisma migrate deploy
+
+      - name: Generate the Prisma Client
+        run: pnpm --filter demo exec prisma generate
+
+      - name: Run the demo
+        run: pnpm --filter demo demo
+
+      # The demo prints; these assert. They cover what only a real database can
+      # answer -- the generated DDL, the triggers and the settings a revision
+      # travels on -- so a regression that produces wrong rows without throwing
+      # fails here rather than passing quietly.
+      - name: Verify the history it produced
+        run: pnpm --filter demo verify

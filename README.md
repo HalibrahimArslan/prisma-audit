@@ -1,5 +1,7 @@
 # prisma-audit
 
+[![CI](https://github.com/HalibrahimArslan/prisma-audit/actions/workflows/ci.yml/badge.svg)](https://github.com/HalibrahimArslan/prisma-audit/actions/workflows/ci.yml)
+
 Hibernate Envers-style auditing for Prisma. Annotate a model, and every
 `create` / `update` / `delete` is recorded in a generated history table under a
 central `Revision`, readable through an `AuditReader`.
@@ -141,11 +143,16 @@ pnpm db:up            # PostgreSQL on port 55432
 pnpm audit:generate   # schema.prisma -> prisma/.audit
 pnpm migrate          # creates Product, Stock, revision, product_aud, stock_aud
 pnpm demo
+pnpm verify           # the same ground, asserted rather than printed
 ```
 
 It prints a product's full history, time-travels to an earlier revision, diffs
-two revisions, shows that a deleted row keeps its history, and shows that a
-`[NotAudited]` column never reaches the audit table.
+two revisions, shows that a deleted row keeps its history, shows that a
+`[NotAudited]` column never reaches the audit table, and records a `Payment`
+written by raw SQL that never went through Prisma at all.
+
+`pnpm verify` is what CI gates on: the same database, with each of those claims
+written as an assertion.
 
 ---
 

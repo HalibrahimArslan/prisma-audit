@@ -171,7 +171,13 @@ The extension only sees what goes through Prisma. A raw `UPDATE` left no trace.
 
 ## M7 — Release
 
-- CI: unit tests plus the demo against a PostgreSQL service container.
+- ✅ CI. GitHub Actions runs the unit suite on the Node version the package
+  declares as its floor and on the current release, then the demo end to end
+  against a PostgreSQL service container: the annotated schema preprocessed,
+  the committed migrations applied with `migrate deploy` — trigger SQL and all
+  — and the demo run. `pnpm verify` follows it with the same ground asserted
+  rather than printed, so a regression that writes wrong audit rows without
+  throwing fails the build instead of passing quietly.
 - ✅ `tsc` build validated by `npm pack` and installing the tarball into a
   scratch project: the CLI, parser, generator and runtime all resolve with
   `@prisma/client` absent.
