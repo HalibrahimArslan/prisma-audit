@@ -1,7 +1,8 @@
 # Roadmap
 
-The plan the project is being built against. Milestones 0–6 are done and verified
-against a real PostgreSQL database; everything from M7 on is open work.
+The plan the project is being built against. Every milestone here is done: the
+package is on npm, and CI runs the unit suite, the PostgreSQL demo end to end,
+and the same auditing against SQLite, MySQL and PostgreSQL on every push.
 
 ---
 
@@ -200,12 +201,9 @@ The extension only sees what goes through Prisma. A raw `UPDATE` left no trace.
   deriving what it can, leaving absent what it cannot, and failing only on a
   file newer than the build reading it. Version 1 → 2 widened `primaryKey` to a
   list of columns; 2 → 3 added how relations join.
-- Publish `prisma-audit` to npm. The package is ready to go out: keywords,
-  repository, homepage and bugs are filled in, the LICENSE and a CHANGELOG
-  travel with the tarball, and `npm pack` installed into a scratch project
-  resolves the CLI, the parser, the generator and the runtime with
-  `@prisma/client` absent. What is left is the publish itself, which needs an
-  npm login.
+- ✅ Published to npm as `prisma-audit@0.1.0`, tagged `v0.1.0`. Installing it
+  from the registry into an empty project resolves the CLI and all forty
+  exports with `@prisma/client` absent.
 
 ---
 

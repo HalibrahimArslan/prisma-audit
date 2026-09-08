@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.0 — unreleased
+## 0.1.0 — 2026-09-08
 
 The first release. Envers-style auditing for Prisma, end to end.
 

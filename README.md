@@ -39,16 +39,8 @@ done and what is next.
 
 ## Install
 
-Not on npm yet, so install it from a tarball built out of this repository:
-
 ```bash
-pnpm install && pnpm build
-cd packages/prisma-audit && npm pack        # -> prisma-audit-0.1.0.tgz
-```
-
-```bash
-# in your own project
-npm install /path/to/prisma-audit-0.1.0.tgz
+npm install prisma-audit
 ```
 
 That gives you both the `prisma-audit` CLI and the runtime. `@prisma/client` is
