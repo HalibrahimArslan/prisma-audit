@@ -1,0 +1,60 @@
+// The models the portability checks run against, without a datasource or a
+// generator block: src/run.ts writes one of those per provider and prepends it.
+//
+// Deliberately plain. Native type attributes (@db.Decimal, @db.VarChar) are
+// provider-specific by definition and belong to the demo; what is being asked
+// here is whether the *generated* schema — Revision, the enum, the audit tables
+// and their composite keys — is one every provider accepts.
+
+enum Currency {
+  TRY
+  USD
+}
+
+[Auditable]
+model Product {
+  id       Int      @id @default(autoincrement())
+  name     String
+  price    Decimal
+  currency Currency @default(TRY)
+
+  [NotAudited]
+  internalCode String?
+
+  stock Stock?
+}
+
+[Auditable]
+[AuditTable(StockHistory)]
+model Stock {
+  id        Int     @id @default(autoincrement())
+  productId Int     @unique @map("product_id")
+  quantity  Int
+  product   Product @relation(fields: [productId], references: [id])
+
+  @@map("stock")
+}
+
+[Auditable]
+model Order {
+  id     Int    @id @default(autoincrement())
+  status String
+
+  [AuditedRelation]
+  lines OrderLine[]
+}
+
+[Auditable]
+model OrderLine {
+  orderId  Int
+  lineNo   Int
+  quantity Int
+  order    Order @relation(fields: [orderId], references: [id])
+
+  @@id([orderId, lineNo])
+}
+
+model Category {
+  id   Int    @id @default(autoincrement())
+  name String
+}

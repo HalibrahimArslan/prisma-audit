@@ -30,8 +30,10 @@ await prisma.audit.for("Product").id(1).atRevision(120n);
 await prisma.audit.for("Product").id(1).diff(100n, 120n);
 ```
 
-Status: **working end to end** against PostgreSQL and Prisma 7. See
-[docs/ROADMAP.md](docs/ROADMAP.md) for what is done and what is next.
+Status: **working end to end** on Prisma 7, against PostgreSQL, MySQL and
+SQLite — the same checks run on all three in CI, and PostgreSQL additionally
+carries the trigger work. See [docs/ROADMAP.md](docs/ROADMAP.md) for what is
+done and what is next.
 
 ---
 
@@ -125,6 +127,7 @@ packages/prisma-audit/     the published package
   src/reader/              AuditReader / AuditQuery
   src/cli/                 prisma-audit generate
 examples/demo/             a runnable PostgreSQL walkthrough
+examples/portability/      the same auditing, asserted on every provider
 docs/ROADMAP.md            milestones, done and planned
 ```
 
@@ -478,6 +481,13 @@ payload is not. List columns and relation fields are excluded from audit tables;
 the scalar foreign key is kept. A write that never goes through Prisma — raw
 SQL, another service — is recorded only for a model that carries
 `[AuditTriggers]`, and that is PostgreSQL only.
+
+Two things follow from the database rather than from this package. On SQLite the
+revision key is an `Int` and its ids come back as numbers, because SQLite
+autoincrements nothing else; everywhere else it is a `BigInt`. And on a database
+that cannot insert and return rows in one statement — MySQL among them —
+`createMany` is replayed one row at a time, which is what lets the generated
+keys be audited at all.
 
 ---
 

@@ -1,5 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 
+import type { RevisionId } from "../metadata.js";
+
 /** Who performed the change. Supplied by the application, not by Prisma. */
 export interface AuditUser {
   userId?: string;
@@ -12,7 +14,7 @@ export interface AuditContext {
    * The revision every audit row written inside this scope belongs to.
    * One transaction produces exactly one revision, the way Envers does it.
    */
-  revisionId?: bigint;
+  revisionId?: RevisionId;
   /**
    * The transaction client that both the source write and the audit write run
    * on, so the two either commit together or roll back together.

@@ -3,8 +3,10 @@ packages:
   - "examples/*"
 
 # Prisma downloads its query engine and esbuild its native binary in a
-# postinstall script; both are required for the demo to run.
+# postinstall script; both are required for the demo to run, as is
+# better-sqlite3's native build for the portability checks.
 allowBuilds:
   '@prisma/engines': true
+  better-sqlite3: true
   esbuild: true
   prisma: true

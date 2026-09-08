@@ -11,3 +11,4 @@ examples/demo/prisma/.audit/
 .claude/settings.local.json
 __pycache__/
 *.pyc
+examples/portability/.scratch/

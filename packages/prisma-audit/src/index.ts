@@ -19,6 +19,7 @@ export {
   auditedFields,
   columnNameOf,
   requireAuditableModel,
+  type RevisionId,
   tableNameOf,
   triggerBackedModels,
   type AuditField,

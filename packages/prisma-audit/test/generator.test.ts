@@ -207,6 +207,47 @@ datasource db {
   });
 });
 
+describe("the revision key across providers", () => {
+  const MINIMAL = `[Auditable]
+model Product {
+  id   Int    @id @default(autoincrement())
+  name String
+}
+`;
+
+  function schemaFor(provider: string): string {
+    const source = `datasource db {\n  provider = "${provider}"\n}\n\n${MINIMAL}`;
+    return generateAuditSchema(parseSchemaText(source).metadata);
+  }
+
+  it("is a BigInt on a database that can autoincrement one", () => {
+    const generated = schemaFor("postgresql");
+
+    assert.match(block(generated, "Revision"), /id\s+BigInt\s+@id @default\(autoincrement\(\)\)/);
+    assert.match(block(generated, "ProductAud"), /revisionId BigInt/);
+  });
+
+  it("is an Int on SQLite, which autoincrements nothing else", () => {
+    // SQLite gives a column autoincrement by making it an alias of the rowid,
+    // and only a column declared exactly INTEGER qualifies. A BigInt key would
+    // produce a table whose every insert fails on a NOT NULL id.
+    const generated = schemaFor("sqlite");
+
+    assert.match(block(generated, "Revision"), /id\s+Int\s+@id @default\(autoincrement\(\)\)/);
+    assert.match(block(generated, "ProductAud"), /revisionId Int\b/);
+  });
+
+  it("stays a BigInt when the schema names no provider", () => {
+    // Metadata written before the parser read the datasource block, and the
+    // one database the generated SQL was ever verified against.
+    assert.match(block(schemaFor("mysql"), "Revision"), /id\s+BigInt/);
+    assert.match(
+      block(generateAuditSchema(parseSchemaText(MINIMAL).metadata), "Revision"),
+      /id\s+BigInt/,
+    );
+  });
+});
+
 /** Extract a single `model X { ... }` block from generated output. */
 function block(schema: string, name: string): string {
   const match = new RegExp(`model ${name} \\{[\\s\\S]*?\\n\\}`).exec(schema);

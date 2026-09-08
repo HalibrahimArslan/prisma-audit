@@ -1,4 +1,4 @@
-import { requireAuditableModel, type AuditMetadata } from "../metadata.js";
+import { requireAuditableModel, type AuditMetadata, type RevisionId } from "../metadata.js";
 import { isComposite, keyOf } from "../util/keys.js";
 import { AuditQuery } from "./audit-query.js";
 
@@ -7,7 +7,7 @@ type AnyClient = any;
 
 /** A revision together with every audit row recorded under it. */
 export interface RevisionSummary {
-  id: bigint;
+  id: RevisionId;
   timestamp: Date;
   userId: string | null;
   username: string | null;

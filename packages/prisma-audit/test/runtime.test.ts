@@ -574,6 +574,45 @@ describe("bulk writes", () => {
     assert.equal(h.productAud.rows.length, 2);
   });
 
+  it("replays the insert on a database that cannot insert and return", async () => {
+    // MySQL is the case this was found on: the generated client carries
+    // createManyAndReturn whatever the database is, and only refuses the call
+    // once it has been made, so the delegate cannot be asked whether the
+    // database supports it.
+    const mysql = structuredClone(metadata);
+    mysql.provider = "mysql";
+
+    const h = harness({ metadata: mysql });
+
+    const result = await inRevision(h, () =>
+      h.client.product.createMany({
+        data: [
+          { name: "a", price: 1 },
+          { name: "b", price: 2 },
+        ],
+      }),
+    );
+
+    assert.deepEqual(result, { count: 2 });
+    assert.ok(!h.product.calls.includes("createManyAndReturn"));
+    assert.equal(h.product.calls.filter((call) => call === "create").length, 2);
+    assert.equal(h.productAud.rows.length, 2);
+  });
+
+  it("replays the insert when the metadata names no provider at all", async () => {
+    // An older audit.metadata.json. Row by row is correct on every database;
+    // guessing that the fast path exists is not.
+    const unknown = structuredClone(metadata);
+    delete unknown.provider;
+
+    const h = harness({ metadata: unknown });
+
+    await inRevision(h, () => h.client.product.createMany({ data: [{ name: "a", price: 1 }] }));
+
+    assert.ok(!h.product.calls.includes("createManyAndReturn"));
+    assert.equal(h.productAud.rows.length, 1);
+  });
+
   it("skips duplicates on the row-by-row path when the caller asked for it", async () => {
     const h = harness({}, false);
     h.product.rows.push({ id: 1, name: "taken", price: 1, categoryId: null });

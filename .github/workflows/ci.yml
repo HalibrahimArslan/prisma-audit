@@ -103,3 +103,33 @@ jobs:
       # fails here rather than passing quietly.
       - name: Verify the history it produced
         run: pnpm --filter demo verify
+
+  portability:
+    name: SQLite, MySQL and PostgreSQL
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - run: pnpm build
+
+      # Compose rather than service containers: MySQL needs a server argument
+      # to load the auth plugin Prisma's connector can speak, and a service
+      # container takes docker options but not a command. Running the same file
+      # a developer runs also keeps the two from drifting.
+      - name: Start MySQL and PostgreSQL
+        run: pnpm --filter portability db:up
+
+      # Each provider gets an empty database, the generated schema pushed into
+      # it, a client of its own, and the same checks run through it.
+      - name: Audit the same models on every provider
+        run: pnpm --filter portability check

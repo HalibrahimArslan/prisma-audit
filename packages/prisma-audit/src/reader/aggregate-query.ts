@@ -10,6 +10,7 @@
  * pointed at this root and had not been deleted.
  */
 
+import type { RevisionId } from "../metadata.js";
 import {
   aggregateRelations,
   type AuditField,
@@ -31,7 +32,7 @@ export interface AggregateEntry<T = Record<string, unknown>> extends AuditRevisi
 
 /** A revision that changed the root or one of its children. */
 export interface AggregateRevision {
-  revisionId: bigint;
+  revisionId: RevisionId;
   timestamp: Date;
   user: { userId: string | null; username: string | null };
   changes: Array<{
@@ -63,7 +64,7 @@ export class AggregateQuery<T = Record<string, unknown>> {
     metadata: AuditMetadata,
     private readonly root: AuditModel,
     private readonly key: EntityKey,
-    private readonly rootAt: (revisionId: bigint) => Promise<AuditRevisionEntry<T> | null>,
+    private readonly rootAt: (revisionId: RevisionId) => Promise<AuditRevisionEntry<T> | null>,
     relations: string[],
   ) {
     this.children = resolveChildren(metadata, root, relations);
@@ -73,7 +74,7 @@ export class AggregateQuery<T = Record<string, unknown>> {
    * The aggregate as it stood at `revisionId`, or `null` when the root did not
    * exist then — the same answer `AuditQuery.atRevision` gives.
    */
-  async atRevision(revisionId: bigint): Promise<AggregateEntry<T> | null> {
+  async atRevision(revisionId: RevisionId): Promise<AggregateEntry<T> | null> {
     const entry = await this.rootAt(revisionId);
     if (!entry) return null;
 
@@ -94,10 +95,10 @@ export class AggregateQuery<T = Record<string, unknown>> {
    * to have touched *this* aggregate.
    */
   async getRevisions(): Promise<AggregateRevision[]> {
-    const byRevision = new Map<bigint, AggregateRevision["changes"]>();
+    const byRevision = new Map<RevisionId, AggregateRevision["changes"]>();
 
     const add = (
-      revisionId: bigint,
+      revisionId: RevisionId,
       change: AggregateRevision["changes"][number],
     ): void => {
       const changes = byRevision.get(revisionId) ?? [];
@@ -136,7 +137,7 @@ export class AggregateQuery<T = Record<string, unknown>> {
   /** The children that belonged to the root at `revisionId`. */
   private async childrenAt(
     child: AggregateChild,
-    revisionId: bigint,
+    revisionId: RevisionId,
   ): Promise<Record<string, unknown>[]> {
     // Every child that ever belonged to this root by then. A row that has since
     // been moved away or deleted is filtered out once its state is known.
@@ -193,7 +194,7 @@ export class AggregateQuery<T = Record<string, unknown>> {
 
   /** Attach each revision's bookkeeping to what it changed. */
   private async describe(
-    byRevision: Map<bigint, AggregateRevision["changes"]>,
+    byRevision: Map<RevisionId, AggregateRevision["changes"]>,
   ): Promise<AggregateRevision[]> {
     if (byRevision.size === 0) return [];
 

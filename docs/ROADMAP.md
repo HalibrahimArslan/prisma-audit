@@ -181,7 +181,20 @@ The extension only sees what goes through Prisma. A raw `UPDATE` left no trace.
 - ✅ `tsc` build validated by `npm pack` and installing the tarball into a
   scratch project: the CLI, parser, generator and runtime all resolve with
   `@prisma/client` absent.
-- MySQL and SQLite verification; the generator is portable but untested there.
+- ✅ MySQL and SQLite verification. `examples/portability` writes a datasource
+  header onto one shared model file per provider, pushes the generated schema
+  into an empty database, generates a client and runs the same nine checks
+  through it — on SQLite, MySQL and PostgreSQL, in CI as well as locally.
+  Assumed portability turned out to hide two real faults. The revision key was
+  a `BigInt`, which SQLite cannot autoincrement: it gives a column that by
+  making it an alias of the rowid, and only a column declared exactly `INTEGER`
+  qualifies, so every insert into `revision` failed on a NOT NULL id. It is now
+  an `Int` on SQLite alone, and `RevisionId` is `bigint | number` throughout.
+  And `createMany` chose its strategy by asking the delegate whether it had
+  `createManyAndReturn`, which the generated client answers yes to on every
+  database and only refuses once the call has been made; the provider decides
+  now, and an unknown one replays the insert row by row, which is correct
+  everywhere.
 - ✅ Upgrade path for `audit.metadata.json`: the file is versioned, and
   `loadMetadata` upgrades an older one in memory rather than refusing to start —
   deriving what it can, leaving absent what it cannot, and failing only on a

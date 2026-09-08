@@ -120,6 +120,17 @@ export interface AuditModel {
   line: number;
 }
 
+/**
+ * A revision's identifier, as the database hands it back.
+ *
+ * `bigint` on every provider but SQLite, where the revision key has to be an
+ * `Int` for SQLite to autoincrement it at all, and the client therefore returns
+ * a number. Both are only ever compared with each other or passed back into a
+ * query, so the runtime and the reader take either rather than converting and
+ * leaving two spellings of the same revision in circulation.
+ */
+export type RevisionId = bigint | number;
+
 /** The metadata format this build of prisma-audit writes and reads. */
 export const METADATA_VERSION = 5;
 

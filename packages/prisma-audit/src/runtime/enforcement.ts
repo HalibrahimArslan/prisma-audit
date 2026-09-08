@@ -1,4 +1,4 @@
-import { triggerBackedModels, type AuditModel } from "../metadata.js";
+import { triggerBackedModels, type AuditModel, type RevisionId } from "../metadata.js";
 import {
   SETTING_REVISION_ID,
   SETTING_SUPPRESS,
@@ -104,7 +104,7 @@ export function triggerWrites(
 export async function publishRevision(
   tx: AnyClient,
   enforcement: Enforcement,
-  revisionId: bigint,
+  revisionId: RevisionId,
   user: AuditUser | undefined,
 ): Promise<void> {
   // An absent user is published as the empty string rather than left unset:

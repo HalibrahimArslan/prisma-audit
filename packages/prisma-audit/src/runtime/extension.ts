@@ -2,6 +2,7 @@ import {
   auditedFields,
   type AuditMetadata,
   type AuditModel,
+  type RevisionId,
 } from "../metadata.js";
 import {
   batchSize,
@@ -75,6 +76,20 @@ const REV_TYPE: Record<string, string> = {
   update: "UPDATE",
   delete: "DELETE",
 };
+
+/**
+ * Providers that can insert and return the inserted rows in one statement.
+ *
+ * Prisma documents `createManyAndReturn` as supported on these alone, and the
+ * generated client is no help in telling: it carries the method whatever the
+ * database is and rejects the call at request time on one that cannot run it.
+ */
+const INSERT_RETURNING_PROVIDERS = new Set([
+  "postgresql",
+  "postgres",
+  "cockroachdb",
+  "sqlite",
+]);
 
 /** Providers whose `createManyAndReturn` also accepts `skipDuplicates`. */
 const SKIP_DUPLICATES_PROVIDERS = new Set(["postgresql", "postgres", "cockroachdb"]);
@@ -457,9 +472,9 @@ async function runBulk(
  * `createMany` reports only a count, and the rows carry database-generated
  * keys, so there is nothing to audit unless the insert gives the rows back.
  *
- * `createManyAndReturn` does exactly that, and Prisma only puts it on the
- * delegate for the databases that support it — which makes the delegate itself
- * the capability check. Everywhere else the insert is replayed row by row.
+ * `createManyAndReturn` does exactly that, where the database can do it.
+ * Everywhere else — MySQL among them — the insert is replayed row by row,
+ * which costs one statement per row and is why the fast path is worth having.
  */
 async function createManyAudited(
   options: AuditOptions,
@@ -501,12 +516,20 @@ function canInsertReturning(
   model: AuditModel,
   args: any,
 ): boolean {
+  const provider = options.provider ?? options.metadata.provider;
+
+  // The provider decides, not the delegate: the generated client offers
+  // `createManyAndReturn` on every database and only refuses the call once it
+  // has been made. A provider this build has never heard of replays the insert
+  // row by row, which is correct everywhere and merely slower.
+  if (provider === undefined || !INSERT_RETURNING_PROVIDERS.has(provider)) return false;
+
+  // An older client may still not have the method at all.
   if (typeof client[model.delegate]?.createManyAndReturn !== "function") return false;
   if (!args?.skipDuplicates) return true;
 
   // SQLite has `createManyAndReturn` but rejects `skipDuplicates` on it.
-  const provider = options.provider ?? options.metadata.provider;
-  return provider !== undefined && SKIP_DUPLICATES_PROVIDERS.has(provider);
+  return SKIP_DUPLICATES_PROVIDERS.has(provider);
 }
 
 /** An operation that already hands back the rows it wrote. */
@@ -664,7 +687,7 @@ async function writeAuditRows(
 ): Promise<void> {
   if (entries.length === 0) return;
 
-  const revisionId = context.revisionId as bigint;
+  const revisionId = context.revisionId as RevisionId;
   const written = (context.written ??= new Map());
 
   /** Rows not yet in the audit table, so they can be inserted in one go. */
@@ -737,7 +760,7 @@ export async function openRevision(
   tx: AnyClient,
   enforcement: Enforcement | undefined,
   user: AuditUser | undefined,
-): Promise<{ id: bigint }> {
+): Promise<{ id: RevisionId }> {
   const revision = await createRevision(tx, user);
   if (enforcement) await publishRevision(tx, enforcement, revision.id, user);
   return revision;
@@ -746,7 +769,7 @@ export async function openRevision(
 export async function createRevision(
   tx: AnyClient,
   user: AuditUser | undefined,
-): Promise<{ id: bigint }> {
+): Promise<{ id: RevisionId }> {
   return tx.revision.create({
     data: {
       userId: user?.userId ?? null,

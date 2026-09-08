@@ -8,7 +8,7 @@
  * composite case is handled in one place instead of at each call site.
  */
 
-import type { AuditModel } from "../metadata.js";
+import type { AuditModel, RevisionId } from "../metadata.js";
 
 /** The value of every key column of a row, keyed by column name. */
 export type EntityKey = Record<string, unknown>;
@@ -92,7 +92,7 @@ export function whereAnyOf(model: AuditModel, keys: EntityKey[]): Record<string,
  */
 export function whereAuditRow(
   model: AuditModel,
-  revisionId: bigint,
+  revisionId: RevisionId,
   key: EntityKey,
 ): Record<string, unknown> {
   const name = ["revisionId", ...model.primaryKey].join("_");

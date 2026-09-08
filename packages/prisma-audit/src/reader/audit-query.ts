@@ -1,4 +1,9 @@
-import { auditedFields, type AuditMetadata, type AuditModel } from "../metadata.js";
+import {
+  auditedFields,
+  type AuditMetadata,
+  type AuditModel,
+  type RevisionId,
+} from "../metadata.js";
 import { isComposite, keyOf, type EntityKey } from "../util/keys.js";
 import { sameValue } from "../util/values.js";
 import { AggregateQuery } from "./aggregate-query.js";
@@ -7,7 +12,7 @@ export type RevisionType = "INSERT" | "UPDATE" | "DELETE";
 
 /** One point in a row's history: what it looked like, who changed it, when. */
 export interface AuditRevisionEntry<T = Record<string, unknown>> {
-  revisionId: bigint;
+  revisionId: RevisionId;
   revType: RevisionType;
   timestamp: Date;
   user: { userId: string | null; username: string | null };
@@ -93,7 +98,7 @@ export class AuditQuery<T = Record<string, unknown>> {
    * before that revision. Returns `null` when the row did not exist yet, or
    * when it had already been deleted.
    */
-  async atRevision(revisionId: bigint): Promise<AuditRevisionEntry<T> | null> {
+  async atRevision(revisionId: RevisionId): Promise<AuditRevisionEntry<T> | null> {
     const rows = await this.client[this.model.auditDelegate].findMany({
       where: { ...this.whereId(), revisionId: { lte: revisionId } },
       orderBy: { revisionId: "desc" },
@@ -109,7 +114,7 @@ export class AuditQuery<T = Record<string, unknown>> {
   }
 
   /** Revisions of the row within an inclusive revision range, oldest first. */
-  async between(from: bigint, to: bigint): Promise<AuditRevisionEntry<T>[]> {
+  async between(from: RevisionId, to: RevisionId): Promise<AuditRevisionEntry<T>[]> {
     const rows = await this.client[this.model.auditDelegate].findMany({
       where: { ...this.whereId(), revisionId: { gte: from, lte: to } },
       orderBy: { revisionId: "asc" },
@@ -127,7 +132,7 @@ export class AuditQuery<T = Record<string, unknown>> {
    * not exist on one side is treated as an empty state, which makes the diff of
    * an INSERT or a DELETE read naturally.
    */
-  async diff(from: bigint, to: bigint): Promise<EntityDiff> {
+  async diff(from: RevisionId, to: RevisionId): Promise<EntityDiff> {
     const [before, after] = await Promise.all([
       this.stateAt(from),
       this.stateAt(to),
@@ -147,7 +152,7 @@ export class AuditQuery<T = Record<string, unknown>> {
     return diff;
   }
 
-  private async stateAt(revisionId: bigint): Promise<Record<string, unknown>> {
+  private async stateAt(revisionId: RevisionId): Promise<Record<string, unknown>> {
     const entry = await this.atRevision(revisionId);
     return (entry?.entity as Record<string, unknown>) ?? {};
   }

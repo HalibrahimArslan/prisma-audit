@@ -1,0 +1,23 @@
+{
+  "name": "portability",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "db:up": "docker compose up -d --wait",
+    "db:down": "docker compose down -v",
+    "check": "tsx src/run.ts"
+  },
+  "dependencies": {
+    "@prisma/client": "7.10.0",
+    "prisma-audit": "workspace:*"
+  },
+  "devDependencies": {
+    "@prisma/adapter-better-sqlite3": "^7.10.0",
+    "@prisma/adapter-mariadb": "^7.10.0",
+    "@prisma/adapter-pg": "^7.10.0",
+    "@types/node": "^22.15.3",
+    "prisma": "7.10.0",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3"
+  }
+}
