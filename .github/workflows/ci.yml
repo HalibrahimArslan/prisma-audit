@@ -12,16 +12,8 @@ concurrency:
 
 jobs:
   unit:
-    name: Unit tests (node ${{ matrix.node }})
+    name: Unit tests
     runs-on: ubuntu-latest
-
-    strategy:
-      fail-fast: false
-      matrix:
-        # The floor the package declares, and the current release. The runtime
-        # leans on AsyncLocalStorage and the test suite on node:test, so the
-        # floor is worth holding to rather than assuming.
-        node: ["20", "24"]
 
     steps:
       - uses: actions/checkout@v4
@@ -31,7 +23,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: ${{ matrix.node }}
+          node-version: "24"
           cache: pnpm
 
       - run: pnpm install --frozen-lockfile
@@ -41,6 +33,17 @@ jobs:
       - run: pnpm build
 
       - run: pnpm test
+
+      # The package declares Node 20 as its floor, and pnpm 11 needs 22.13, so
+      # the floor cannot run the toolchain that builds the suite. The step
+      # above has already compiled it, so it is run again here under plain
+      # node -- which is the thing the claim is actually about.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Run the same suite on the oldest Node the package supports
+        run: node --test packages/prisma-audit/dist-test/test/*.test.js
 
   demo:
     name: End-to-end against PostgreSQL

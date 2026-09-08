@@ -45,6 +45,7 @@
   ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
+    "prepare": "tsc -p tsconfig.build.json",
     "test": "tsc -p tsconfig.json --noEmit false && node --test dist-test/test/*.test.js",
     "clean": "rm -rf dist dist-test"
   },
