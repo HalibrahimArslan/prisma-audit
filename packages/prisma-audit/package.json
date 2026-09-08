@@ -2,6 +2,30 @@
   "name": "prisma-audit",
   "version": "0.1.0",
   "description": "Hibernate Envers style auditing for Prisma: [Auditable] annotations, generated *Aud tables, a central Revision table and an AuditReader.",
+  "keywords": [
+    "prisma",
+    "audit",
+    "auditing",
+    "audit-log",
+    "audit-trail",
+    "envers",
+    "hibernate-envers",
+    "history",
+    "versioning",
+    "temporal",
+    "postgresql",
+    "prisma-extension"
+  ],
+  "homepage": "https://github.com/HalibrahimArslan/prisma-audit#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/HalibrahimArslan/prisma-audit.git",
+    "directory": "packages/prisma-audit"
+  },
+  "bugs": {
+    "url": "https://github.com/HalibrahimArslan/prisma-audit/issues"
+  },
+  "author": "arslan",
   "type": "module",
   "license": "MIT",
   "exports": {
@@ -13,7 +37,12 @@
   "bin": {
     "prisma-audit": "./dist/cli/bin.js"
   },
-  "files": ["dist", "README.md"],
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "test": "tsc -p tsconfig.json --noEmit false && node --test dist-test/test/*.test.js",
@@ -23,11 +52,15 @@
     "@prisma/client": ">=6"
   },
   "peerDependenciesMeta": {
-    "@prisma/client": { "optional": true }
+    "@prisma/client": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@types/node": "^22.15.3",
     "typescript": "^5.9.3"
   },
-  "engines": { "node": ">=20" }
+  "engines": {
+    "node": ">=20"
+  }
 }

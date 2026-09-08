@@ -200,7 +200,12 @@ The extension only sees what goes through Prisma. A raw `UPDATE` left no trace.
   deriving what it can, leaving absent what it cannot, and failing only on a
   file newer than the build reading it. Version 1 → 2 widened `primaryKey` to a
   list of columns; 2 → 3 added how relations join.
-- Publish `prisma-audit` to npm.
+- Publish `prisma-audit` to npm. The package is ready to go out: keywords,
+  repository, homepage and bugs are filled in, the LICENSE and a CHANGELOG
+  travel with the tarball, and `npm pack` installed into a scratch project
+  resolves the CLI, the parser, the generator and the runtime with
+  `@prisma/client` absent. What is left is the publish itself, which needs an
+  npm login.
 
 ---
 
