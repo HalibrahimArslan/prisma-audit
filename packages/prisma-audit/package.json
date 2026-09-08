@@ -35,7 +35,7 @@
     }
   },
   "bin": {
-    "prisma-audit": "./dist/cli/bin.js"
+    "prisma-audit": "dist/cli/bin.js"
   },
   "files": [
     "dist",
