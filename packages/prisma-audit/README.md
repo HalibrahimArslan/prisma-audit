@@ -199,6 +199,10 @@ export const prisma = withAudit(new PrismaClient({ adapter }), {
 | `"skip"`        | performs the write with no audit record                           |
 | `"error"`       | refuses the write                                                 |
 
+It governs the runtime's own recording only. A trigger-backed model is recorded
+by the database whatever this says — `"skip"` on such a write means the trigger
+opens the revision itself, and it carries no user.
+
 ### Read
 
 ```ts
