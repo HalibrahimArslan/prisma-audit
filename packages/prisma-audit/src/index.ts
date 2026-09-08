@@ -17,7 +17,10 @@ export {
   aggregateRelations,
   auditableModels,
   auditedFields,
+  columnNameOf,
   requireAuditableModel,
+  tableNameOf,
+  triggerBackedModels,
   type AuditField,
   type AuditFieldKind,
   type AuditMetadata,
@@ -37,6 +40,12 @@ export {
 export { ANNOTATIONS, type AnnotationName } from "./parser/annotations.js";
 
 export { generateAuditSchema, type GenerateOptions } from "./generator/index.js";
+export {
+  TRIGGER_NAME,
+  generateTriggerSql,
+  triggerFunctionName,
+  type TriggerOptions,
+} from "./generator/triggers.js";
 export { rebaseRelativePaths } from "./generator/rebase.js";
 
 export {
@@ -76,6 +85,13 @@ export {
 } from "./reader/aggregate-query.js";
 
 export { loadMetadata } from "./util/load-metadata.js";
+export {
+  SETTING_REVISION_ID,
+  SETTING_SUPPRESS,
+  SETTING_USER_ID,
+  SETTING_USERNAME,
+  SUPPRESS_ON,
+} from "./util/settings.js";
 export { toDelegateName, toSnakeCase } from "./util/naming.js";
 export { resolveRelationLink, type JoinColumn, type RelationLink } from "./util/relations.js";
 
@@ -85,3 +101,10 @@ export {
   type GenerateCommandOptions,
   type GenerateCommandResult,
 } from "./cli/generate.js";
+
+export {
+  describeTriggers,
+  runTriggers,
+  type TriggersCommandOptions,
+  type TriggersCommandResult,
+} from "./cli/triggers.js";

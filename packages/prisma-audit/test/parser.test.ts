@@ -398,3 +398,162 @@ model OrderLine {
     );
   });
 });
+
+/** A schema with the postgresql datasource that [AuditTriggers] requires. */
+function pg(body: string): string {
+  return `datasource db {\n  provider = "postgresql"\n}\n\n${body}`;
+}
+
+describe("physical names", () => {
+  it("reads the table a model is mapped to", () => {
+    const { metadata } = parseSchemaText(
+      '[Auditable]\nmodel Product {\n  id Int @id\n\n  @@map("products")\n}\n',
+    );
+
+    assert.equal(metadata.models[0]?.tableName, "products");
+  });
+
+  it("reads @@map written with an explicit name argument", () => {
+    const { metadata } = parseSchemaText(
+      '[Auditable]\nmodel Product {\n  id Int @id\n\n  @@map(name: "products")\n}\n',
+    );
+
+    assert.equal(metadata.models[0]?.tableName, "products");
+  });
+
+  it("falls back to the model name, which is what Prisma does", () => {
+    const { metadata } = parseSchemaText("[Auditable]\nmodel Product {\n  id Int @id\n}\n");
+
+    assert.equal(metadata.models[0]?.tableName, "Product");
+  });
+
+  it("leaves the audit table derived from the model name, not the mapped one", () => {
+    const { metadata } = parseSchemaText(
+      '[Auditable]\nmodel Product {\n  id Int @id\n\n  @@map("products")\n}\n',
+    );
+
+    assert.equal(metadata.models[0]?.auditTableName, "product_aud");
+  });
+
+  it("reads the column a field is mapped to", () => {
+    const { metadata } = parseSchemaText(
+      '[Auditable]\nmodel Product {\n  id Int @id\n  trackingNo String @map("tracking_no")\n}\n',
+    );
+
+    const field = metadata.models[0]?.fields.find((candidate) => candidate.name === "trackingNo");
+    assert.equal(field?.columnName, "tracking_no");
+  });
+
+  it("reads @map written with an explicit name argument", () => {
+    const { metadata } = parseSchemaText(
+      '[Auditable]\nmodel Product {\n  id Int @id\n  trackingNo String @map(name: "tracking_no")\n}\n',
+    );
+
+    const field = metadata.models[0]?.fields.find((candidate) => candidate.name === "trackingNo");
+    assert.equal(field?.columnName, "tracking_no");
+  });
+
+  it("falls back to the field name", () => {
+    const { metadata } = parseSchemaText("[Auditable]\nmodel Product {\n  id Int @id\n}\n");
+
+    assert.equal(metadata.models[0]?.fields[0]?.columnName, "id");
+  });
+
+  it("is not confused by a quoted parenthesis in another attribute", () => {
+    const { metadata } = parseSchemaText(
+      '[Auditable]\nmodel Product {\n  id Int @id\n  note String @default("(") @map("note_text")\n}\n',
+    );
+
+    const field = metadata.models[0]?.fields.find((candidate) => candidate.name === "note");
+    assert.equal(field?.columnName, "note_text");
+  });
+
+  it("rejects a model mapped onto another model's audit table", () => {
+    assert.throws(
+      () =>
+        parseSchemaText(
+          '[Auditable]\nmodel Product {\n  id Int @id\n}\n\nmodel Legacy {\n  id Int @id\n\n  @@map("product_aud")\n}\n',
+        ),
+      /is the audit table of Product/,
+    );
+  });
+
+  it("rejects a model mapped onto the audit table it generates itself", () => {
+    assert.throws(
+      () =>
+        parseSchemaText(
+          '[Auditable]\nmodel Product {\n  id Int @id\n\n  @@map("product_aud")\n}\n',
+        ),
+      /also the audit table it generates/,
+    );
+  });
+});
+
+describe("[AuditTriggers]", () => {
+  it("marks the model as trigger-backed", () => {
+    const { metadata } = parseSchemaText(
+      pg("[Auditable]\n[AuditTriggers]\nmodel Product {\n  id Int @id\n}\n"),
+    );
+
+    assert.equal(metadata.models[0]?.triggers, true);
+  });
+
+  it("stacks in either order", () => {
+    const { metadata } = parseSchemaText(
+      pg("[AuditTriggers]\n[Auditable]\nmodel Product {\n  id Int @id\n}\n"),
+    );
+
+    assert.equal(metadata.models[0]?.triggers, true);
+  });
+
+  it("stacks with [AuditTable]", () => {
+    const { metadata } = parseSchemaText(
+      pg("[Auditable]\n[AuditTable(ProductHistory)]\n[AuditTriggers]\nmodel Product {\n  id Int @id\n}\n"),
+    );
+
+    assert.equal(metadata.models[0]?.triggers, true);
+    assert.equal(metadata.models[0]?.auditTableName, "product_history");
+  });
+
+  it("leaves an unannotated model alone", () => {
+    const { metadata } = parseSchemaText(
+      pg("[Auditable]\nmodel Product {\n  id Int @id\n}\n"),
+    );
+
+    assert.equal(metadata.models[0]?.triggers, undefined);
+  });
+
+  it("rejects the annotation without [Auditable]", () => {
+    assert.throws(
+      () => parseSchemaText(pg("[AuditTriggers]\nmodel Product {\n  id Int @id\n}\n")),
+      /does nothing without \[Auditable\]/,
+    );
+  });
+
+  it("rejects the annotation written twice", () => {
+    assert.throws(
+      () =>
+        parseSchemaText(
+          pg("[Auditable]\n[AuditTriggers]\n[AuditTriggers]\nmodel Product {\n  id Int @id\n}\n"),
+        ),
+      /more than once/,
+    );
+  });
+
+  it("rejects a datasource that is not postgresql", () => {
+    assert.throws(
+      () =>
+        parseSchemaText(
+          'datasource db {\n  provider = "sqlite"\n}\n\n[Auditable]\n[AuditTriggers]\nmodel Product {\n  id Int @id\n}\n',
+        ),
+      /needs a postgresql datasource, and this schema declares sqlite/,
+    );
+  });
+
+  it("rejects a schema with no datasource at all", () => {
+    assert.throws(
+      () => parseSchemaText("[Auditable]\n[AuditTriggers]\nmodel Product {\n  id Int @id\n}\n"),
+      /declares none/,
+    );
+  });
+});

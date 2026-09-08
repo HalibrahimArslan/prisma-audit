@@ -43,6 +43,12 @@ export interface AuditRelation {
 export interface AuditField {
   /** Field name as written in `schema.prisma`. */
   name: string;
+  /**
+   * The column the field is stored in: `@map("...")`, or the field name, which
+   * is what Prisma falls back to. Prisma hides the difference, but a trigger is
+   * written against the name the database actually has.
+   */
+  columnName?: string;
   /** Prisma type name, without the `?` / `[]` modifiers. */
   type: string;
   kind: AuditFieldKind;
@@ -76,8 +82,20 @@ export interface AuditField {
 export interface AuditModel {
   /** Model name in `schema.prisma`, e.g. `Product`. */
   name: string;
+  /**
+   * The table the model is stored in: `@@map("...")`, or the model name, which
+   * is what Prisma falls back to — verbatim, so in PostgreSQL it is the
+   * case-sensitive `"Product"` rather than `product`.
+   */
+  tableName?: string;
   /** `true` when the model carries `[Auditable]`. */
   auditable: boolean;
+  /**
+   * `true` when the model carries `[AuditTriggers]`: its audit rows are written
+   * by a database trigger rather than by the runtime, so the history holds for
+   * a write that never went through Prisma.
+   */
+  triggers?: boolean;
   /** Generated audit model name, e.g. `ProductAud`. */
   auditModelName: string;
   /** Table name the audit model maps to, e.g. `product_aud`. */
@@ -103,7 +121,7 @@ export interface AuditModel {
 }
 
 /** The metadata format this build of prisma-audit writes and reads. */
-export const METADATA_VERSION = 4;
+export const METADATA_VERSION = 5;
 
 export interface AuditMetadata {
   /**
@@ -111,7 +129,9 @@ export interface AuditMetadata {
    * `AuditModel.primaryKey` from a single column name into the list of columns
    * that form the key; version 3 added `AuditField.relation`, which is what
    * lets a nested write be followed to the rows it reaches; version 4 added
-   * `AuditField.aggregate`. `loadMetadata` upgrades an older file in memory as
+   * `AuditField.aggregate`; version 5 added the physical names a trigger is
+   * written against — `AuditModel.tableName`, `AuditField.columnName` — and
+   * `AuditModel.triggers`. `loadMetadata` upgrades an older file in memory as
    * far as it can.
    */
   version: number;
@@ -140,6 +160,33 @@ export function aggregateRelations(model: AuditModel): AuditField[] {
 /** Only the models that carry `[Auditable]`. */
 export function auditableModels(metadata: AuditMetadata): AuditModel[] {
   return metadata.models.filter((model) => model.auditable);
+}
+
+/**
+ * The table a model is stored in.
+ *
+ * Metadata written before version 5 carries no physical names, because the
+ * parser did not read `@@map` then — so falling back to Prisma's own default is
+ * exactly right for the schemas that file could describe.
+ */
+export function tableNameOf(model: AuditModel): string {
+  return model.tableName ?? model.name;
+}
+
+/** The column a field is stored in. Same fallback as `tableNameOf`. */
+export function columnNameOf(field: AuditField): string {
+  return field.columnName ?? field.name;
+}
+
+/**
+ * The models whose audit rows a database trigger writes.
+ *
+ * Absent means off, which is the safe direction: metadata that predates
+ * triggers, or that is merely stale, leaves the runtime writing the rows itself
+ * rather than quietly recording nothing.
+ */
+export function triggerBackedModels(metadata: AuditMetadata): AuditModel[] {
+  return metadata.models.filter((model) => model.auditable && model.triggers === true);
 }
 
 /** Look up an auditable model by its schema name, or throw a helpful error. */

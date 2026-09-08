@@ -30,6 +30,12 @@ export const ANNOTATIONS = {
    * model's aggregate, so its history can be read together with theirs.
    */
   auditedRelation: "AuditedRelation",
+  /**
+   * Placed above an `[Auditable]` model: a database trigger writes its audit
+   * rows, so a write that never went through Prisma is recorded too. The
+   * runtime then stops writing them itself for that model.
+   */
+  auditTriggers: "AuditTriggers",
 } as const;
 
 export type AnnotationName = (typeof ANNOTATIONS)[keyof typeof ANNOTATIONS];

@@ -47,6 +47,16 @@ export function loadMetadata(metadataPath: string = DEFAULT_PATH): AuditMetadata
  * how relations join, so a nested write is reported as unauditable until the
  * metadata is regenerated, which is what it would do for an unfollowable
  * relation anyway.
+ *
+ * Version 5 needs no code at all. It added the physical table and column names,
+ * and `tableNameOf` / `columnNameOf` fall back to Prisma's own defaults, which
+ * is exactly right for the schemas an older file could describe: the parser did
+ * not read `@@map` before version 5, so no such file can be carrying a mapped
+ * name that the fallback would get wrong. Version 5 also added `triggers`, and
+ * absent reads as off — the safe direction, since a stale file leaves the
+ * runtime writing the audit rows itself rather than quietly recording nothing.
+ * The other direction, triggers installed while the metadata says otherwise,
+ * fails loudly on a duplicate audit row and rolls the write back.
  */
 function upgrade(metadata: AuditMetadata): AuditMetadata {
   if (metadata.version < 2) {

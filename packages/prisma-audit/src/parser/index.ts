@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import {
   METADATA_VERSION,
   PRISMA_SCALARS,
+  tableNameOf,
   type AuditField,
   type AuditRelation,
   type AuditFieldKind,
@@ -50,6 +51,8 @@ const PROVIDER = /^\s*provider\s*=\s*"([^"]+)"/;
 /** `@@id([orderId, lineNo], name: "orderLine")`, with the argument list captured. */
 const BLOCK_ID = /^\s*@@id\s*\(\s*\[([^\]]*)\]\s*(?:,([^)]*))?\)/;
 const KEY_NAME = /\bname\s*:\s*"([^"]+)"/;
+/** `@@map("product")`, written either positionally or as `name:`. */
+const BLOCK_MAP = /^\s*@@map\s*\(\s*(?:name\s*:\s*)?"([^"]+)"\s*\)/;
 /** A Prisma model name, as `[AuditTable(...)]` may supply one. */
 const IDENTIFIER = /^[A-Za-z][A-Za-z0-9_]*$/;
 
@@ -127,6 +130,9 @@ export function parseSchemaText(source: string): ParseResult {
       if (kind === "model") {
         currentModel = {
           name,
+          // Prisma's default: the table is the model name, verbatim. `@@map`
+          // overrides it further down the block.
+          tableName: name,
           auditable: false,
           auditModelName: `${name}Aud`,
           auditTableName: `${toSnakeCase(name)}_aud`,
@@ -220,7 +226,12 @@ function parseModelLine(
       if (name) model.primaryKeyName = name[1] as string;
 
       keyLines.set(model.name, lineNumber);
+      return;
     }
+
+    const blockMap = BLOCK_MAP.exec(trimmed);
+    if (blockMap) model.tableName = blockMap[1] as string;
+
     return;
   }
 
@@ -247,6 +258,7 @@ function parseModelLine(
 
   const field: AuditField = {
     name,
+    columnName: columnName(name, attributes),
     type,
     kind: "scalar", // refined once every enum in the file is known
     isList,
@@ -265,6 +277,22 @@ function parseModelLine(
   if (isId && !keyLines.has(model.name)) model.primaryKey = [name];
 
   model.fields.push(field);
+}
+
+/**
+ * The column a field is stored in.
+ *
+ * `@map` renames it, and both `@map("x")` and `@map(name: "x")` are written, so
+ * the first quoted string inside the attribute is the name either way. The
+ * attribute is located with `splitAttributes` rather than a regular expression
+ * over the whole line, which is what keeps a quoted parenthesis in some other
+ * attribute — `@default("(")` — from being mistaken for one.
+ */
+function columnName(name: string, attributes: string): string {
+  const map = splitAttributes(attributes).find((candidate) => candidate.name === "map");
+  const quoted = map && /"([^"]+)"/.exec(map.text);
+
+  return quoted ? (quoted[1] as string) : name;
 }
 
 /** `[a, b]` inside an attribute argument, e.g. `fields: [categoryId]`. */
@@ -311,11 +339,14 @@ interface PendingAnnotation {
 /**
  * Apply the annotations written above a `model` declaration.
  *
- * `[Auditable]` and `[AuditTable(...)]` stack, in either order, and each may be
- * written only once.
+ * `[Auditable]`, `[AuditTable(...)]` and `[AuditTriggers]` stack, in any order,
+ * and each may be written only once. The two that depend on `[Auditable]` are
+ * held back until the whole run has been read, so they can be written above it
+ * as well as below it.
  */
 function applyModelAnnotations(model: AuditModel, pending: PendingAnnotation[]): void {
   let naming: PendingAnnotation | undefined;
+  let triggers: PendingAnnotation | undefined;
 
   for (const annotation of pending) {
     if (annotation.name === ANNOTATIONS.notAudited) {
@@ -336,6 +367,17 @@ function applyModelAnnotations(model: AuditModel, pending: PendingAnnotation[]):
       continue;
     }
 
+    if (annotation.name === ANNOTATIONS.auditTriggers) {
+      if (triggers) {
+        throw new AuditSchemaError(
+          `Model ${model.name} carries [${ANNOTATIONS.auditTriggers}] more than once`,
+          annotation.line,
+        );
+      }
+      triggers = annotation;
+      continue;
+    }
+
     if (naming) {
       throw new AuditSchemaError(
         `Model ${model.name} carries [${ANNOTATIONS.auditTable}] more than once`,
@@ -346,6 +388,16 @@ function applyModelAnnotations(model: AuditModel, pending: PendingAnnotation[]):
   }
 
   if (naming) applyAuditTableName(model, naming);
+
+  if (triggers) {
+    if (!model.auditable) {
+      throw new AuditSchemaError(
+        `[${ANNOTATIONS.auditTriggers}] on model ${model.name} does nothing without [${ANNOTATIONS.auditable}]`,
+        triggers.line,
+      );
+    }
+    model.triggers = true;
+  }
 }
 
 /**
@@ -532,6 +584,36 @@ function validateNames(metadata: AuditMetadata, enumLines: Map<string, number>):
       taken.set(`${kind}:${name}`, model.name);
     }
   }
+
+  validateSourceTables(metadata);
+}
+
+/**
+ * A source table cannot share a name with an audit table.
+ *
+ * Without `@@map` the two could never meet — `Product` against `product_aud` —
+ * but a mapped model picks its own table name, and a collision would have the
+ * history written into the very table it is recording.
+ */
+function validateSourceTables(metadata: AuditMetadata): void {
+  const auditTables = new Map<string, string>();
+
+  for (const model of metadata.models) {
+    if (model.auditable) auditTables.set(model.auditTableName, model.name);
+  }
+
+  for (const model of metadata.models) {
+    const table = tableNameOf(model);
+    const owner = auditTables.get(table);
+    if (owner === undefined) continue;
+
+    throw new AuditSchemaError(
+      owner === model.name
+        ? `Model ${model.name} is stored in ${table}, which is also the audit table it generates. Map it elsewhere, or rename the audit table with [${ANNOTATIONS.auditTable}("...")]`
+        : `Model ${model.name} is stored in ${table}, which is the audit table of ${owner}. Map it elsewhere, or rename that audit table with [${ANNOTATIONS.auditTable}("...")]`,
+      model.line,
+    );
+  }
 }
 
 function validate(metadata: AuditMetadata, keyLines: Map<string, number>): void {
@@ -539,6 +621,16 @@ function validate(metadata: AuditMetadata, keyLines: Map<string, number>): void 
     if (!model.auditable) continue;
 
     const keyLine = keyLines.get(model.name) ?? model.line;
+
+    // The generated SQL is PostgreSQL: MySQL triggers have no `ON CONFLICT`,
+    // and SQLite has no transaction-local setting to carry the revision in.
+    // Each would be a different design rather than the same one ported.
+    if (model.triggers && metadata.provider !== "postgresql") {
+      throw new AuditSchemaError(
+        `[${ANNOTATIONS.auditTriggers}] on model ${model.name} needs a postgresql datasource, and this schema declares ${metadata.provider ?? "none"}`,
+        model.line,
+      );
+    }
 
     if (model.primaryKey.length === 0) {
       throw new AuditSchemaError(

@@ -1,8 +1,13 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 
-import { auditableModels, type AuditMetadata } from "../metadata.js";
+import {
+  auditableModels,
+  triggerBackedModels,
+  type AuditMetadata,
+} from "../metadata.js";
 import { generateAuditSchema } from "../generator/index.js";
+import { generateTriggerSql } from "../generator/triggers.js";
 import { rebaseRelativePaths } from "../generator/rebase.js";
 import { parseSchemaFile } from "../parser/index.js";
 
@@ -11,6 +16,15 @@ export interface GenerateCommandOptions {
   schema: string;
   /** Directory the Prisma-ready schema is written to. */
   outDir: string;
+  /**
+   * Treat every `[Auditable]` model as `[AuditTriggers]` as well.
+   *
+   * A shorthand for a schema where every audited model should be enforced in
+   * the database, so the annotation does not have to be repeated forty times.
+   * The metadata and the SQL are written from this one decision in this one
+   * command, which is what keeps the two from disagreeing.
+   */
+  triggers?: boolean;
 }
 
 export interface GenerateCommandResult {
@@ -39,6 +53,10 @@ export async function runGenerate(
 
   const { cleanSchema, metadata, warnings } = await parseSchemaFile(schemaPath);
 
+  if (options.triggers) {
+    for (const model of auditableModels(metadata)) model.triggers = true;
+  }
+
   await fs.mkdir(outDir, { recursive: true });
 
   const cleanPath = path.join(outDir, "schema.prisma");
@@ -57,11 +75,18 @@ export async function runGenerate(
   await fs.writeFile(auditPath, generateAuditSchema(metadata), "utf8");
   await fs.writeFile(metadataPath, `${JSON.stringify(metadata, null, 2)}\n`, "utf8");
 
-  return {
-    metadata,
-    warnings,
-    written: [cleanPath, auditPath, metadataPath],
-  };
+  const written = [cleanPath, auditPath, metadataPath];
+
+  // A copy for inspection and diffing. The one that actually runs is the one
+  // committed under prisma/migrations, since this directory is generated and
+  // git-ignored — `prisma-audit triggers` is what writes that one.
+  if (triggerBackedModels(metadata).length > 0) {
+    const triggersPath = path.join(outDir, "audit.triggers.sql");
+    await fs.writeFile(triggersPath, generateTriggerSql(metadata), "utf8");
+    written.push(triggersPath);
+  }
+
+  return { metadata, warnings, written };
 }
 
 /** A one-line summary of what was generated, for CLI output. */
@@ -77,7 +102,8 @@ export function describeResult(result: GenerateCommandResult): string {
       const audited = model.fields.filter((field) => field.audited).length;
       const skipped = model.fields.length - audited;
       const suffix = skipped > 0 ? `, ${skipped} field(s) excluded` : "";
-      return `  ${model.name} -> ${model.auditModelName} (${audited} column(s)${suffix})`;
+      const enforced = model.triggers ? ", trigger" : "";
+      return `  ${model.name} -> ${model.auditModelName} (${audited} column(s)${suffix}${enforced})`;
     })
     .join("\n");
 }
