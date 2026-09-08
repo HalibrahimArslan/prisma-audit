@@ -60,7 +60,8 @@ it carries annotations Prisma does not understand. `prisma-audit generate`
 preprocesses it:
 
 ```
-prisma/schema.prisma            you edit this: [Auditable], [NotAudited], [AuditTable], [AuditedRelation]
+prisma/schema.prisma            you edit this: [Auditable], [NotAudited], [AuditTable],
+        │                                      [AuditedRelation], [AuditTriggers]
         │
         ▼
    prisma-audit generate
@@ -104,9 +105,11 @@ are nullable so that a column added to the model later does not invalidate
 revisions recorded before it existed. The key columns cannot be, because they
 are part of `@@id([revisionId, …])`.
 
-**Writes that bypass Prisma are not audited.** A raw `UPDATE product SET ...`
-leaves no trace. Database triggers are the answer for that, and are on the
-roadmap; the extension is a convenience layer, not a security boundary.
+**The extension is a convenience layer, not a boundary.** It sees what goes
+through Prisma, so a raw `UPDATE product SET ...` leaves no trace. Where the
+history has to hold whatever writes the table, `[AuditTriggers]` moves the
+recording into the database itself — see
+[Enforcement below the application](#enforcement-below-the-application).
 
 ---
 
@@ -151,8 +154,15 @@ two revisions, shows that a deleted row keeps its history, and shows that a
 ### Generate
 
 ```bash
-prisma-audit generate [--schema prisma/schema.prisma] [--out prisma/.audit]
+prisma-audit generate [--schema prisma/schema.prisma] [--out prisma/.audit] [--triggers]
+prisma-audit triggers [--schema prisma/schema.prisma] [--out file.sql] [--drop]
 ```
+
+`generate` writes the Prisma-ready schema and the metadata; `--triggers` treats
+every `[Auditable]` model as `[AuditTriggers]` as well, for a schema where the
+whole history is enforced in the database. `triggers` writes the SQL that
+installs them, to stdout unless `--out` names a file — see
+[Enforcement below the application](#enforcement-below-the-application).
 
 Point Prisma at the output directory, in `prisma.config.ts`:
 
@@ -176,6 +186,7 @@ export const prisma = withAudit(new PrismaClient({ adapter }), {
   userProvider: () => currentRequestUser(),   // optional
   onMissingRevision: "transaction",           // "transaction" | "skip" | "error"
   onNestedWrite: (model, relation, target) => {},  // optional, see Nested writes
+  triggers: "auto",                           // "auto" | "suppress" | "off"
 });
 ```
 
@@ -234,7 +245,7 @@ isolation level if that matters.
 
 ## Annotations
 
-Four of them, written in square brackets above the declaration they apply to.
+Five of them, written in square brackets above the declaration they apply to.
 `prisma-audit generate` strips them out, so `schema.prisma` stays a file you own
 and Prisma never sees the annotations.
 
@@ -244,6 +255,7 @@ and Prisma never sees the annotations.
 | `[NotAudited]`       | a field                | the field is left out of the audit table      |
 | `[AuditTable(...)]`  | an `[Auditable]` model | names that audit table                        |
 | `[AuditedRelation]`  | a relation field       | its rows are part of this model's aggregate   |
+| `[AuditTriggers]`    | an `[Auditable]` model | the database records it, not the runtime      |
 
 By default the history of `Product` is the model `ProductAud`, mapped to the
 table `product_aud`. `[AuditTable]` overrides that, in either of two ways:
@@ -365,12 +377,96 @@ row's own columns change, and two relations between the same models with no
 `@relation("name")` to tell them apart. Pass `onNestedWrite` to `withAudit` to
 handle those yourself instead of warning.
 
+## Enforcement below the application
+
+The query extension records what goes through Prisma. `[AuditTriggers]` records
+what goes through the *database*: a raw `UPDATE`, another service, a psql
+session, a cascade.
+
+```prisma
+[Auditable]
+[AuditTriggers]
+model Payment {
+  id      Int     @id @default(autoincrement())
+  orderId Int     @map("order_id")
+  amount  Decimal @db.Decimal(12, 2)
+  status  String
+
+  @@map("payment")
+}
+```
+
+The audit table is the same one, and so is the reader —
+`prisma.audit.for("Payment").id(1).getRevisions()` does not care which half
+wrote the rows. What changes is who writes them: for a trigger-backed model the
+runtime stands back, issuing the statement exactly as you wrote it. A bulk write
+costs one statement rather than the three auditing it in the runtime needs.
+
+PostgreSQL only. MySQL triggers have no `ON CONFLICT`, and SQLite has no
+transaction-local setting to carry a revision in, so each would be a different
+design rather than this one ported.
+
+### Installing them
+
+Triggers are ordinary SQL in an ordinary migration: Prisma migrate neither
+generates them nor sees them drift.
+
+```bash
+prisma migrate dev --create-only --name audit_triggers
+prisma-audit triggers >> prisma/migrations/<timestamp>_audit_triggers/migration.sql
+prisma migrate dev
+```
+
+The file is idempotent and convergent — every statement is `CREATE OR REPLACE`
+or `DROP … IF EXISTS`, and it closes with a sweep that removes whatever an
+earlier version installed and this one does not. Re-running the newest file
+therefore reaches the same state whichever one was applied last, so a schema
+change and its trigger update can travel in one migration.
+
+### How a revision reaches the trigger
+
+A trigger cannot see your call stack, so the runtime publishes the revision and
+the acting user on the transaction with `set_config(..., true)`, which reverts
+when the transaction ends. A trigger that finds one published records against
+it; one that finds nothing — a write that never went through the application —
+opens a revision of its own and publishes it back, so every later statement of
+that transaction shares it. One unit of work is one revision either way, and a
+transaction that writes both a trigger-backed model and a runtime-audited one
+produces a single revision holding both changes.
+
+A write from outside the application has no user to record, so its revision
+carries none.
+
+### Deploying them
+
+`triggers` in the runtime options says how the two halves divide the work:
+
+| value        | behaviour                                                              |
+| ------------ | ---------------------------------------------------------------------- |
+| `"auto"`     | default — the metadata decides, model by model; costs nothing when no model is trigger-backed |
+| `"suppress"` | the runtime writes every audit row itself and the triggers stand down   |
+| `"off"`      | the runtime writes every audit row itself and publishes nothing         |
+
+`"suppress"` is what makes the migration and the build independent, in either
+order and without a write being recorded twice:
+
+1. deploy the current build with `triggers: "suppress"` — a no-op while no
+   trigger exists;
+2. apply the migration that installs them; they stand down on sight of the
+   setting, and the runtime keeps recording as before;
+3. deploy the build generated from the `[AuditTriggers]` schema, with
+   `triggers` back to `"auto"`.
+
+Rolling back is the same list read upwards. `"off"` is the escape hatch for a
+database whose triggers were dropped before the metadata caught up.
+
 ## Current limitations
 
 Nested writes are followed one level deep: a payload nested inside a nested
 payload is not. List columns and relation fields are excluded from audit tables;
 the scalar foreign key is kept. A write that never goes through Prisma — raw
-SQL, another service — leaves no trace; database triggers are on the roadmap.
+SQL, another service — is recorded only for a model that carries
+`[AuditTriggers]`, and that is PostgreSQL only.
 
 ---
 

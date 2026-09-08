@@ -64,6 +64,56 @@ async function main(): Promise<void> {
   await composite();
   await nested(category.id);
   await aggregate();
+  await enforcement();
+}
+
+/**
+ * Enforcement below the application. Payment is [AuditTriggers], so a database
+ * trigger writes its audit rows and a statement that never went through Prisma
+ * is recorded just the same.
+ */
+async function enforcement(): Promise<void> {
+  // A mixed transaction: Payment's audit row is the trigger's to write and
+  // Order's is the runtime's, and both land under the one revision — the
+  // runtime publishes it on the transaction before either write runs.
+  const payment = await prisma.$auditTransaction(halil, async (tx) => {
+    const created = await tx.payment.create({
+      data: { orderId: 1, amount: 45_000, status: "authorised" },
+    });
+
+    await tx.order.update({ where: { id: 1 }, data: { status: "paid" } });
+
+    return created;
+  });
+
+  // Raw SQL on the connection, the way another service or a psql session
+  // writes. The extension never sees it; the trigger does, and opens a
+  // revision of its own because nothing published one.
+  await prisma.$executeRawUnsafe(
+    "UPDATE payment SET status = $1 WHERE id = $2",
+    "captured",
+    payment.id,
+  );
+  await prisma.$executeRawUnsafe("DELETE FROM payment WHERE id = $1", payment.id);
+
+  console.log("\n── Enforcement: a trigger-backed model's history ───────────");
+  for (const entry of await prisma.audit.for("Payment").id(payment.id).getRevisions()) {
+    const entity = entry.entity as Record<string, unknown>;
+    console.log(
+      `  rev ${String(entry.revisionId).padStart(3)}  ${entry.revType.padEnd(6)}` +
+        `  by ${(entry.user.username ?? "-").padEnd(6)}  status=${String(entity.status)}`,
+    );
+  }
+
+  // The first of those revisions is the one the Order update is recorded under
+  // too: one unit of work, one revision, whichever half wrote the row.
+  console.log("\n── Enforcement: what each of those revisions touched ───────");
+  for (const revision of (await prisma.audit.revisions(3)).reverse()) {
+    const changes = revision.changes
+      .map((change) => `${change.model}#${formatKey(change.id)} ${change.revType}`)
+      .join(", ");
+    console.log(`  rev ${String(revision.id).padStart(3)}  ${revision.username ?? "-"}  ${changes}`);
+  }
 }
 
 /**
@@ -365,7 +415,7 @@ function summarise(entity: unknown): string {
 /** Start from a clean slate so the demo can be run repeatedly. */
 async function reset(): Promise<void> {
   await prisma.$executeRawUnsafe(
-    'TRUNCATE TABLE "product_aud", "stock_history", "order_line_aud", "order_aud", "revision", "Stock", "Product", "OrderLine", "Order", "Category" RESTART IDENTITY CASCADE',
+    'TRUNCATE TABLE "product_aud", "stock_history", "order_line_aud", "order_aud", "payment_aud", "revision", "Stock", "Product", "OrderLine", "Order", "payment", "Category" RESTART IDENTITY CASCADE',
   );
 }
 

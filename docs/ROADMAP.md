@@ -1,7 +1,7 @@
 # Roadmap
 
-The plan the project is being built against. Milestones 0–5 are done and verified
-against a real PostgreSQL database; everything from M6 on is open work.
+The plan the project is being built against. Milestones 0–6 are done and verified
+against a real PostgreSQL database; everything from M7 on is open work.
 
 ---
 
@@ -131,15 +131,43 @@ same transaction — the documented cost is that one statement becomes two.
   and generated names are checked against everything the schema declares —
   including the `Revision` model prisma-audit emits itself.
 
-## M6 — Enforcement below the application
+## M6 — Enforcement below the application ✅
 
-The extension only sees what goes through Prisma. A raw `UPDATE` leaves no trace.
+The extension only sees what goes through Prisma. A raw `UPDATE` left no trace.
 
-- Generate PostgreSQL triggers alongside the audit tables, so the history holds
-  regardless of who writes.
-- Reconcile the two: the trigger needs the revision and the acting user, which
-  means a transaction-local setting the runtime writes.
-- Keep it opt-in — triggers change the migration story materially.
+- ✅ Generated PostgreSQL triggers. `[AuditTriggers]` on an `[Auditable]` model
+  hands its audit rows to the database, and `prisma-audit triggers` emits the
+  SQL: one `AFTER INSERT OR UPDATE OR DELETE` trigger per table over a function
+  per audit table, plus one shared function that resolves the revision. The
+  trigger transcribes the rule the runtime already applied in memory — a row
+  touched twice in one revision keeps one audit record holding the state it
+  ended up in, and created-then-changed stays an `INSERT`. Being SQL rather
+  than Prisma, it needed the physical names, so the parser now reads `@@map`
+  and `@map`, and a model mapped onto an audit table is a parse error rather
+  than a history written into the table it records.
+- ✅ Idempotent and convergent rather than incremental: every statement is
+  `CREATE OR REPLACE` or `DROP … IF EXISTS`, and the file closes with a sweep
+  driven from `pg_trigger` and `pg_proc` that removes what an earlier version
+  installed and this one does not. Applying the newest file reaches the same
+  state whichever one was applied last, so a schema change and its trigger
+  update travel in one migration.
+- ✅ Reconciled the two halves. The runtime publishes the revision and the
+  acting user on the transaction with `set_config(..., true)`; a trigger that
+  finds one recorded against it, and one that finds nothing opens a revision
+  and publishes it back. A transaction that writes both a trigger-backed model
+  and a runtime-audited one therefore produces a single revision holding both.
+  For a trigger-backed model the extension stands back entirely, so a bulk
+  write costs one statement rather than three.
+- ✅ Opt-in, and deployable in either order. `triggers: "suppress"` has the
+  runtime write every audit row itself while the triggers stand down, which is
+  what lets the migration that installs them and the build that relies on them
+  go out as independent deploys. Misconfiguration is caught when the client is
+  built, not on the write that reaches it.
+- PostgreSQL only, deliberately: MySQL triggers have no `ON CONFLICT` and
+  SQLite has no transaction-local setting to carry a revision in.
+- Verified against PostgreSQL by the demo, which records a `Payment` written
+  through Prisma and then updated and deleted by raw SQL, and by direct psql
+  checks of suppression and of a published revision being honoured.
 
 ## M7 — Release
 

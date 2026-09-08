@@ -75,6 +75,21 @@ model OrderLine {
   @@id([orderId, lineNo])
 }
 
+// Enforced below the application: [AuditTriggers] says a database trigger
+// writes this model's audit rows, so a raw UPDATE that never went through
+// Prisma is recorded too. It is also mapped onto names of its own, which the
+// generated SQL has to spell out rather than go through Prisma for.
+[Auditable]
+[AuditTriggers]
+model Payment {
+  id      Int     @id @default(autoincrement())
+  orderId Int     @map("order_id")
+  amount  Decimal @db.Decimal(12, 2)
+  status  String
+
+  @@map("payment")
+}
+
 // Not annotated: writes to Category leave no audit trail.
 model Category {
   id       Int       @id @default(autoincrement())
