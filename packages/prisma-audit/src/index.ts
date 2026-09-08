@@ -3,22 +3,29 @@
  *
  * Three layers, each usable on its own:
  *
- *   parser + generator  `[Auditable]` / `[NotAudited]` in schema.prisma become
- *                       `Revision` and `*Aud` models.
+ *   parser + generator  `[Auditable]` / `[NotAudited]` / `[AuditTable]` /
+ *                       `[AuditedRelation]` in schema.prisma become `Revision`
+ *                       and `*Aud` models.
  *   runtime             `withAudit()` records create/update/delete, one
  *                       revision per transaction.
  *   reader              `AuditReader` walks the history back.
  */
 
 export {
+  METADATA_VERSION,
   PRISMA_SCALARS,
+  aggregateRelations,
   auditableModels,
   auditedFields,
+  columnNameOf,
   requireAuditableModel,
+  tableNameOf,
+  triggerBackedModels,
   type AuditField,
   type AuditFieldKind,
   type AuditMetadata,
   type AuditModel,
+  type AuditRelation,
   type PrismaScalar,
 } from "./metadata.js";
 
@@ -33,6 +40,12 @@ export {
 export { ANNOTATIONS, type AnnotationName } from "./parser/annotations.js";
 
 export { generateAuditSchema, type GenerateOptions } from "./generator/index.js";
+export {
+  TRIGGER_NAME,
+  generateTriggerSql,
+  triggerFunctionName,
+  type TriggerOptions,
+} from "./generator/triggers.js";
 export { rebaseRelativePaths } from "./generator/rebase.js";
 
 export {
@@ -49,6 +62,8 @@ export {
   type PrismaClientLike,
 } from "./runtime/extension.js";
 
+export { type TriggerMode } from "./runtime/enforcement.js";
+
 export {
   withAudit,
   type AuditablePrismaClient,
@@ -59,14 +74,28 @@ export {
 export { AuditReader, type RevisionSummary } from "./reader/audit-reader.js";
 export {
   AuditQuery,
+  toEntity,
   type AuditRevisionEntry,
   type EntityDiff,
   type FieldChange,
   type RevisionType,
 } from "./reader/audit-query.js";
+export {
+  AggregateQuery,
+  type AggregateEntry,
+  type AggregateRevision,
+} from "./reader/aggregate-query.js";
 
 export { loadMetadata } from "./util/load-metadata.js";
+export {
+  SETTING_REVISION_ID,
+  SETTING_SUPPRESS,
+  SETTING_USER_ID,
+  SETTING_USERNAME,
+  SUPPRESS_ON,
+} from "./util/settings.js";
 export { toDelegateName, toSnakeCase } from "./util/naming.js";
+export { resolveRelationLink, type JoinColumn, type RelationLink } from "./util/relations.js";
 
 export {
   describeResult,
@@ -74,3 +103,10 @@ export {
   type GenerateCommandOptions,
   type GenerateCommandResult,
 } from "./cli/generate.js";
+
+export {
+  describeTriggers,
+  runTriggers,
+  type TriggersCommandOptions,
+  type TriggersCommandResult,
+} from "./cli/triggers.js";

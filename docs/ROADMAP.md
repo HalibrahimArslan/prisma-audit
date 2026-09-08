@@ -1,7 +1,7 @@
 # Roadmap
 
-The plan the project is being built against. Milestones 0–3 are done and verified
-against a real PostgreSQL database; everything from M4 on is open work.
+The plan the project is being built against. Milestones 0–6 are done and verified
+against a real PostgreSQL database; everything from M7 on is open work.
 
 ---
 
@@ -45,7 +45,8 @@ is *our* source file, preprocessed into a Prisma-ready schema.
 - `create` / `update` / `delete` are audited from the operation result, which
   Prisma returns in full, so the common path costs no extra query. A `select` or
   `omit` triggers a re-read (and a read-before-delete).
-- Unsupported bulk operations warn once and pass through.
+- Bulk and branching operations were left passing through at this point; M4
+  closed that gap.
 
 ## M3 — AuditReader ✅
 
@@ -57,42 +58,129 @@ is *our* source file, preprocessed into a Prisma-ready schema.
 
 ---
 
-## M4 — Bulk and branching operations
+## M4 — Bulk and branching operations ✅
 
-The main correctness gap. Each needs a read-before-write strategy:
+Every write operation Prisma exposes is now recorded. A bulk statement reports a
+count rather than the rows it touched, so each one is paired with a read on the
+same transaction — the documented cost is that one statement becomes two.
 
-- `updateMany` / `deleteMany`: select the matching rows inside the transaction
-  first, then write one audit row per affected record.
-- `createMany`: `createManyAndReturn` gives the rows back on PostgreSQL; the
-  fallback is a per-row path.
-- `upsert`: resolve to INSERT or UPDATE from whether the row existed.
-- Decide and document the cost: these turn one statement into two.
+- `updateMany`: read the matching keys, write, read the new state back. With
+  `limit` the statement is re-issued against exactly those keys, because
+  otherwise the database is free to pick a different set of rows than the one
+  that was read.
+- `deleteMany`: read the matching rows in full first; afterwards there is
+  nothing left to read.
+- `createMany`: dispatched as `createManyAndReturn` where the delegate has it —
+  Prisma only generates that method for databases that support it, which makes
+  the delegate its own capability check. Elsewhere the insert is replayed row by
+  row, honouring `skipDuplicates`. The `datasource` provider is now carried in
+  `audit.metadata.json`, since SQLite has the method but rejects
+  `skipDuplicates` on it.
+- `createManyAndReturn` / `updateManyAndReturn`: audited from the returned rows,
+  re-read when `select`/`omit` narrowed them.
+- `upsert`: a key lookup before the write decides INSERT from UPDATE.
+- A row touched twice in one revision keeps one audit record, holding the state
+  it ended up in; created-then-changed stays an INSERT. Bulk writes make that
+  overlap ordinary, and the audit table's `(revisionId, id)` key would otherwise
+  reject the second write.
+- Reads and audit inserts are chunked at 1000 rows, to stay under the
+  bind-parameter limit on a large bulk write.
+- Internal re-dispatches carry a bypass flag in the audit context, so a
+  statement prisma-audit issues on the client is not audited twice.
 
-## M5 — Schema coverage
+## M5 — Schema coverage ✅
 
-- Composite primary keys — the generator, `@@id`, and every reader query assume
-  a single key column today.
-- Nested writes: `product.update({ data: { orderLines: { create: … } } })`
-  currently audits only the top-level model.
-- Relation auditing strategies, e.g. auditing an aggregate together with its children.
-- Configurable audit table naming (`[AuditTable(ProductHistory)]`).
+- ✅ Composite primary keys. A model's key is a vector of columns rather than a
+  scalar throughout: the parser reads `@@id([a, b])` (and the `name:` Prisma
+  gives its compound argument), the audit table is keyed
+  `@@id([revisionId, a, b])`, and `util/keys.ts` derives every `where` the
+  runtime and the reader build from that vector. `.id({ orderId, lineNo })`
+  reads the history, which is the same shape `revisions()` reports for a
+  change. There is no `IN (...)` form for a multi-column key, so bulk reads
+  list the keys as alternatives and are chunked by key width. Verified against
+  PostgreSQL by the demo.
+- ✅ Nested writes. `product.update({ data: { stock: { update: … } } })` records
+  the rows it reaches as well as the top-level one. The statement itself is left
+  exactly as the caller wrote it: instead of taking the payload apart and
+  re-issuing it, the rows in reach — those already related to the parent, plus
+  those the payload names by key — are read before and after it, and the
+  difference becomes audit rows. Naming the keys is what tells a connected row
+  from a created one, and a disconnected one from a deleted one; a row in reach
+  that did not actually change records nothing. A write on a model that is not
+  itself audited is followed too, since it can still reach one that is. The cost
+  is two reads per nested relation, paid only when a nested payload is present.
+  The parser now reads `@relation(fields:, references:, name:)`, which is what
+  makes the rows findable; an implicit many-to-many names no join columns and
+  still warns, as does an ambiguous pair of relations. Verified against
+  PostgreSQL by the demo.
+- ✅ Relation auditing strategies. `[AuditedRelation]` on a relation declares
+  that its rows are part of the model's aggregate, and
+  `audit.for("Order").id(1).aggregate()` reads the root together with them:
+  `atRevision` reconstructs the children as they stood then, `getRevisions`
+  lists every revision that changed the root or a child. Nothing extra is
+  stored — a child's audit row already carries the foreign key, so the
+  reconstruction is a read of the latest state per child at or before the
+  revision, keeping the ones that still belonged to that root. A child moved to
+  another root stops belonging from the revision that moved it. The root is the
+  side the children point at, and putting the annotation on the other side is a
+  parse error that says so.
+- ✅ Configurable audit table naming. `[AuditTable(ProductHistory)]` names the
+  generated model and derives the table from it; `[AuditTable("product_history")]`
+  names the table alone, for an audit table that already exists. Annotations now
+  stack on one declaration, which is what let a second one sit above a model,
+  and generated names are checked against everything the schema declares —
+  including the `Revision` model prisma-audit emits itself.
 
-## M6 — Enforcement below the application
+## M6 — Enforcement below the application ✅
 
-The extension only sees what goes through Prisma. A raw `UPDATE` leaves no trace.
+The extension only sees what goes through Prisma. A raw `UPDATE` left no trace.
 
-- Generate PostgreSQL triggers alongside the audit tables, so the history holds
-  regardless of who writes.
-- Reconcile the two: the trigger needs the revision and the acting user, which
-  means a transaction-local setting the runtime writes.
-- Keep it opt-in — triggers change the migration story materially.
+- ✅ Generated PostgreSQL triggers. `[AuditTriggers]` on an `[Auditable]` model
+  hands its audit rows to the database, and `prisma-audit triggers` emits the
+  SQL: one `AFTER INSERT OR UPDATE OR DELETE` trigger per table over a function
+  per audit table, plus one shared function that resolves the revision. The
+  trigger transcribes the rule the runtime already applied in memory — a row
+  touched twice in one revision keeps one audit record holding the state it
+  ended up in, and created-then-changed stays an `INSERT`. Being SQL rather
+  than Prisma, it needed the physical names, so the parser now reads `@@map`
+  and `@map`, and a model mapped onto an audit table is a parse error rather
+  than a history written into the table it records.
+- ✅ Idempotent and convergent rather than incremental: every statement is
+  `CREATE OR REPLACE` or `DROP … IF EXISTS`, and the file closes with a sweep
+  driven from `pg_trigger` and `pg_proc` that removes what an earlier version
+  installed and this one does not. Applying the newest file reaches the same
+  state whichever one was applied last, so a schema change and its trigger
+  update travel in one migration.
+- ✅ Reconciled the two halves. The runtime publishes the revision and the
+  acting user on the transaction with `set_config(..., true)`; a trigger that
+  finds one recorded against it, and one that finds nothing opens a revision
+  and publishes it back. A transaction that writes both a trigger-backed model
+  and a runtime-audited one therefore produces a single revision holding both.
+  For a trigger-backed model the extension stands back entirely, so a bulk
+  write costs one statement rather than three.
+- ✅ Opt-in, and deployable in either order. `triggers: "suppress"` has the
+  runtime write every audit row itself while the triggers stand down, which is
+  what lets the migration that installs them and the build that relies on them
+  go out as independent deploys. Misconfiguration is caught when the client is
+  built, not on the write that reaches it.
+- PostgreSQL only, deliberately: MySQL triggers have no `ON CONFLICT` and
+  SQLite has no transaction-local setting to carry a revision in.
+- Verified against PostgreSQL by the demo, which records a `Payment` written
+  through Prisma and then updated and deleted by raw SQL, and by direct psql
+  checks of suppression and of a published revision being honoured.
 
 ## M7 — Release
 
 - CI: unit tests plus the demo against a PostgreSQL service container.
-- `tsup` or `tsc` build validated by publishing a tarball and installing it.
+- ✅ `tsc` build validated by `npm pack` and installing the tarball into a
+  scratch project: the CLI, parser, generator and runtime all resolve with
+  `@prisma/client` absent.
 - MySQL and SQLite verification; the generator is portable but untested there.
-- Documented upgrade path for `audit.metadata.json` version bumps.
+- ✅ Upgrade path for `audit.metadata.json`: the file is versioned, and
+  `loadMetadata` upgrades an older one in memory rather than refusing to start —
+  deriving what it can, leaving absent what it cannot, and failing only on a
+  file newer than the build reading it. Version 1 → 2 widened `primaryKey` to a
+  list of columns; 2 → 3 added how relations join.
 - Publish `prisma-audit` to npm.
 
 ---

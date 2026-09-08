@@ -64,7 +64,7 @@ describe("parser", () => {
   });
 
   it("finds the single-column primary key", () => {
-    assert.equal(product?.primaryKey, "id");
+    assert.deepEqual(product?.primaryKey, ["id"]);
     assert.equal(field("id")?.isId, true);
   });
 
@@ -122,6 +122,200 @@ describe("parser", () => {
     assert.equal(parsed.metadata.models[0]?.auditable, false);
   });
 
+  it("names the audit model, and derives the table, from [AuditTable(Name)]", () => {
+    const { metadata } = parseSchemaText(
+      "[Auditable]\n[AuditTable(ProductHistory)]\nmodel Product {\n  id Int @id\n}\n",
+    );
+
+    const product = metadata.models[0];
+    assert.equal(product?.auditModelName, "ProductHistory");
+    assert.equal(product?.auditTableName, "product_history");
+    assert.equal(product?.auditDelegate, "productHistory");
+    // The source model is untouched.
+    assert.equal(product?.delegate, "product");
+  });
+
+  it("renames only the table when [AuditTable] is given a quoted name", () => {
+    const { metadata } = parseSchemaText(
+      '[AuditTable("product_hist")]\n[Auditable]\nmodel Product {\n  id Int @id\n}\n',
+    );
+
+    const product = metadata.models[0];
+    assert.equal(product?.auditModelName, "ProductAud");
+    assert.equal(product?.auditTableName, "product_hist");
+  });
+
+  it("rejects [AuditTable] on a model that is not [Auditable]", () => {
+    assert.throws(
+      () => parseSchemaText("[AuditTable(H)]\nmodel Product {\n  id Int @id\n}\n"),
+      /does nothing without \[Auditable\]/,
+    );
+  });
+
+  it("rejects [AuditTable] without a name", () => {
+    assert.throws(
+      () =>
+        parseSchemaText("[Auditable]\n[AuditTable]\nmodel Product {\n  id Int @id\n}\n"),
+      /needs a name/,
+    );
+  });
+
+  it("rejects an audit name the schema already declares", () => {
+    assert.throws(
+      () =>
+        parseSchemaText(
+          "[Auditable]\n[AuditTable(Archive)]\nmodel Product {\n  id Int @id\n}\nmodel Archive {\n  id Int @id\n}\n",
+        ),
+      /already declares on line 6/,
+    );
+  });
+
+  it("rejects two models that would share one audit table", () => {
+    assert.throws(
+      () =>
+        parseSchemaText(
+          '[Auditable]\n[AuditTable("history")]\nmodel A {\n  id Int @id\n}\n[Auditable]\n[AuditTable("history")]\nmodel B {\n  id Int @id\n}\n',
+        ),
+      /would both use the audit table history/,
+    );
+  });
+
+  it("rejects a model that collides with the generated Revision", () => {
+    assert.throws(
+      () => parseSchemaText("model Revision {\n  id Int @id\n}\n"),
+      /collides with the model prisma-audit generates/,
+    );
+  });
+
+  it("rejects an enum that collides with the generated RevisionType", () => {
+    assert.throws(
+      () => parseSchemaText("enum RevisionType {\n  A\n}\n"),
+      /collides with the enum prisma-audit generates/,
+    );
+  });
+
+  it("rejects [NotAudited] written above a model", () => {
+    assert.throws(
+      () => parseSchemaText("[NotAudited]\nmodel A {\n  id Int @id\n}\n"),
+      /can only be placed on a field/,
+    );
+  });
+
+  it("rejects [Auditable] written above a field", () => {
+    assert.throws(
+      () => parseSchemaText("model A {\n  [Auditable]\n  id Int @id\n}\n"),
+      /can only be placed on a model/,
+    );
+  });
+
+  it("marks a relation as part of the model's aggregate", () => {
+    const { metadata } = parseSchemaText(
+      `[Auditable]
+model Order {
+  id    Int @id
+
+  [AuditedRelation]
+  lines OrderLine[]
+}
+
+[Auditable]
+model OrderLine {
+  id      Int   @id
+  orderId Int
+  order   Order @relation(fields: [orderId], references: [id])
+}
+`,
+    );
+
+    const lines = metadata.models[0]?.fields.find((field) => field.name === "lines");
+    assert.equal(lines?.aggregate, true);
+    // It is still a relation field, so it is not a column of the audit table.
+    assert.equal(lines?.audited, false);
+  });
+
+  it("rejects [AuditedRelation] on the side that holds the foreign key", () => {
+    assert.throws(
+      () =>
+        parseSchemaText(
+          `[Auditable]
+model Order {
+  id    Int         @id
+  lines OrderLine[]
+}
+
+[Auditable]
+model OrderLine {
+  id      Int   @id
+  orderId Int
+
+  [AuditedRelation]
+  order   Order @relation(fields: [orderId], references: [id])
+}
+`,
+        ),
+      /OrderLine holds the foreign key.*annotate the matching relation on Order instead/s,
+    );
+  });
+
+  it("rejects [AuditedRelation] to a model that is not audited", () => {
+    assert.throws(
+      () =>
+        parseSchemaText(
+          `[Auditable]
+model Order {
+  id    Int @id
+
+  [AuditedRelation]
+  lines OrderLine[]
+}
+
+model OrderLine {
+  id      Int   @id
+  orderId Int
+  order   Order @relation(fields: [orderId], references: [id])
+}
+`,
+        ),
+      /has to be \[Auditable\] too/,
+    );
+  });
+
+  it("rejects [AuditedRelation] whose join column is [NotAudited]", () => {
+    assert.throws(
+      () =>
+        parseSchemaText(
+          `[Auditable]
+model Order {
+  id    Int @id
+
+  [AuditedRelation]
+  lines OrderLine[]
+}
+
+[Auditable]
+model OrderLine {
+  id      Int   @id
+
+  [NotAudited]
+  orderId Int
+  order   Order @relation(fields: [orderId], references: [id])
+}
+`,
+        ),
+      /cannot be \[NotAudited\]: the audit table joins on it/,
+    );
+  });
+
+  it("rejects [AuditedRelation] on a field that is not a relation", () => {
+    assert.throws(
+      () =>
+        parseSchemaText(
+          "[Auditable]\nmodel A {\n  id Int @id\n\n  [AuditedRelation]\n  name String\n}\n",
+        ),
+      /belongs on a relation field/,
+    );
+  });
+
   it("rejects an auditable model without a primary key", () => {
     assert.throws(
       () => parseSchemaText("[Auditable]\nmodel A {\n  name String\n}\n"),
@@ -129,13 +323,56 @@ describe("parser", () => {
     );
   });
 
-  it("rejects a composite primary key with a specific message", () => {
+  it("reads a composite primary key in the order @@id gives it", () => {
+    const { metadata } = parseSchemaText(
+      "[Auditable]\nmodel A {\n  b Int\n  a Int\n  @@id([a, b])\n}\n",
+    );
+
+    assert.deepEqual(metadata.models[0]?.primaryKey, ["a", "b"]);
+    assert.equal(metadata.models[0]?.primaryKeyName, undefined);
+  });
+
+  it("keeps the name @@id gives a composite key, and drops column modifiers", () => {
+    const { metadata } = parseSchemaText(
+      '[Auditable]\nmodel A {\n  a String\n  b Int\n  @@id([a(length: 100), b], name: "ab")\n}\n',
+    );
+
+    assert.deepEqual(metadata.models[0]?.primaryKey, ["a", "b"]);
+    assert.equal(metadata.models[0]?.primaryKeyName, "ab");
+  });
+
+  it("lets @@id override a field-level @id wherever it is written", () => {
+    const { metadata } = parseSchemaText(
+      "[Auditable]\nmodel A {\n  a Int @id\n  b Int\n  @@id([a, b])\n}\n",
+    );
+
+    assert.deepEqual(metadata.models[0]?.primaryKey, ["a", "b"]);
+  });
+
+  it("rejects a composite key naming a field the model does not have", () => {
+    assert.throws(
+      () => parseSchemaText("[Auditable]\nmodel A {\n  a Int\n  @@id([a, b])\n}\n"),
+      /no field "b"/,
+    );
+  });
+
+  it("rejects a composite key that includes a relation field", () => {
     assert.throws(
       () =>
         parseSchemaText(
-          "[Auditable]\nmodel A {\n  a Int\n  b Int\n  @@id([a, b])\n}\n",
+          "[Auditable]\nmodel A {\n  bId Int\n  b B @relation(fields: [bId], references: [id])\n  @@id([bId, b])\n}\nmodel B {\n  id Int @id\n}\n",
         ),
-      /composite @@id/,
+      /relation field/,
+    );
+  });
+
+  it("rejects [NotAudited] on part of a composite key", () => {
+    assert.throws(
+      () =>
+        parseSchemaText(
+          "[Auditable]\nmodel A {\n  a Int\n  [NotAudited]\n  b Int\n  @@id([a, b])\n}\n",
+        ),
+      /cannot be \[NotAudited\]/,
     );
   });
 
@@ -158,6 +395,165 @@ describe("parser", () => {
     assert.throws(
       () => parseSchemaText("[Auditable]\n\nmodel A {\n  id Int @id\n}\n"),
       /must be followed by/,
+    );
+  });
+});
+
+/** A schema with the postgresql datasource that [AuditTriggers] requires. */
+function pg(body: string): string {
+  return `datasource db {\n  provider = "postgresql"\n}\n\n${body}`;
+}
+
+describe("physical names", () => {
+  it("reads the table a model is mapped to", () => {
+    const { metadata } = parseSchemaText(
+      '[Auditable]\nmodel Product {\n  id Int @id\n\n  @@map("products")\n}\n',
+    );
+
+    assert.equal(metadata.models[0]?.tableName, "products");
+  });
+
+  it("reads @@map written with an explicit name argument", () => {
+    const { metadata } = parseSchemaText(
+      '[Auditable]\nmodel Product {\n  id Int @id\n\n  @@map(name: "products")\n}\n',
+    );
+
+    assert.equal(metadata.models[0]?.tableName, "products");
+  });
+
+  it("falls back to the model name, which is what Prisma does", () => {
+    const { metadata } = parseSchemaText("[Auditable]\nmodel Product {\n  id Int @id\n}\n");
+
+    assert.equal(metadata.models[0]?.tableName, "Product");
+  });
+
+  it("leaves the audit table derived from the model name, not the mapped one", () => {
+    const { metadata } = parseSchemaText(
+      '[Auditable]\nmodel Product {\n  id Int @id\n\n  @@map("products")\n}\n',
+    );
+
+    assert.equal(metadata.models[0]?.auditTableName, "product_aud");
+  });
+
+  it("reads the column a field is mapped to", () => {
+    const { metadata } = parseSchemaText(
+      '[Auditable]\nmodel Product {\n  id Int @id\n  trackingNo String @map("tracking_no")\n}\n',
+    );
+
+    const field = metadata.models[0]?.fields.find((candidate) => candidate.name === "trackingNo");
+    assert.equal(field?.columnName, "tracking_no");
+  });
+
+  it("reads @map written with an explicit name argument", () => {
+    const { metadata } = parseSchemaText(
+      '[Auditable]\nmodel Product {\n  id Int @id\n  trackingNo String @map(name: "tracking_no")\n}\n',
+    );
+
+    const field = metadata.models[0]?.fields.find((candidate) => candidate.name === "trackingNo");
+    assert.equal(field?.columnName, "tracking_no");
+  });
+
+  it("falls back to the field name", () => {
+    const { metadata } = parseSchemaText("[Auditable]\nmodel Product {\n  id Int @id\n}\n");
+
+    assert.equal(metadata.models[0]?.fields[0]?.columnName, "id");
+  });
+
+  it("is not confused by a quoted parenthesis in another attribute", () => {
+    const { metadata } = parseSchemaText(
+      '[Auditable]\nmodel Product {\n  id Int @id\n  note String @default("(") @map("note_text")\n}\n',
+    );
+
+    const field = metadata.models[0]?.fields.find((candidate) => candidate.name === "note");
+    assert.equal(field?.columnName, "note_text");
+  });
+
+  it("rejects a model mapped onto another model's audit table", () => {
+    assert.throws(
+      () =>
+        parseSchemaText(
+          '[Auditable]\nmodel Product {\n  id Int @id\n}\n\nmodel Legacy {\n  id Int @id\n\n  @@map("product_aud")\n}\n',
+        ),
+      /is the audit table of Product/,
+    );
+  });
+
+  it("rejects a model mapped onto the audit table it generates itself", () => {
+    assert.throws(
+      () =>
+        parseSchemaText(
+          '[Auditable]\nmodel Product {\n  id Int @id\n\n  @@map("product_aud")\n}\n',
+        ),
+      /also the audit table it generates/,
+    );
+  });
+});
+
+describe("[AuditTriggers]", () => {
+  it("marks the model as trigger-backed", () => {
+    const { metadata } = parseSchemaText(
+      pg("[Auditable]\n[AuditTriggers]\nmodel Product {\n  id Int @id\n}\n"),
+    );
+
+    assert.equal(metadata.models[0]?.triggers, true);
+  });
+
+  it("stacks in either order", () => {
+    const { metadata } = parseSchemaText(
+      pg("[AuditTriggers]\n[Auditable]\nmodel Product {\n  id Int @id\n}\n"),
+    );
+
+    assert.equal(metadata.models[0]?.triggers, true);
+  });
+
+  it("stacks with [AuditTable]", () => {
+    const { metadata } = parseSchemaText(
+      pg("[Auditable]\n[AuditTable(ProductHistory)]\n[AuditTriggers]\nmodel Product {\n  id Int @id\n}\n"),
+    );
+
+    assert.equal(metadata.models[0]?.triggers, true);
+    assert.equal(metadata.models[0]?.auditTableName, "product_history");
+  });
+
+  it("leaves an unannotated model alone", () => {
+    const { metadata } = parseSchemaText(
+      pg("[Auditable]\nmodel Product {\n  id Int @id\n}\n"),
+    );
+
+    assert.equal(metadata.models[0]?.triggers, undefined);
+  });
+
+  it("rejects the annotation without [Auditable]", () => {
+    assert.throws(
+      () => parseSchemaText(pg("[AuditTriggers]\nmodel Product {\n  id Int @id\n}\n")),
+      /does nothing without \[Auditable\]/,
+    );
+  });
+
+  it("rejects the annotation written twice", () => {
+    assert.throws(
+      () =>
+        parseSchemaText(
+          pg("[Auditable]\n[AuditTriggers]\n[AuditTriggers]\nmodel Product {\n  id Int @id\n}\n"),
+        ),
+      /more than once/,
+    );
+  });
+
+  it("rejects a datasource that is not postgresql", () => {
+    assert.throws(
+      () =>
+        parseSchemaText(
+          'datasource db {\n  provider = "sqlite"\n}\n\n[Auditable]\n[AuditTriggers]\nmodel Product {\n  id Int @id\n}\n',
+        ),
+      /needs a postgresql datasource, and this schema declares sqlite/,
+    );
+  });
+
+  it("rejects a schema with no datasource at all", () => {
+    assert.throws(
+      () => parseSchemaText("[Auditable]\n[AuditTriggers]\nmodel Product {\n  id Int @id\n}\n"),
+      /declares none/,
     );
   });
 });

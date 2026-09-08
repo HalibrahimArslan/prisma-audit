@@ -1,4 +1,5 @@
 import { requireAuditableModel, type AuditMetadata } from "../metadata.js";
+import { isComposite, keyOf } from "../util/keys.js";
 import { AuditQuery } from "./audit-query.js";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -10,6 +11,11 @@ export interface RevisionSummary {
   timestamp: Date;
   userId: string | null;
   username: string | null;
+  /**
+   * What the revision did, one entry per audited row. `id` is the row's primary
+   * key: the value itself for a single-column key, an object of column values
+   * for a composite one — either way, what `AuditQuery.id()` takes.
+   */
   changes: Array<{ model: string; revType: string; id: unknown }>;
 }
 
@@ -29,7 +35,7 @@ export class AuditReader {
   /** Start a history query for an audited model. */
   for<T = Record<string, unknown>>(modelName: string): AuditQuery<T> {
     const model = requireAuditableModel(this.metadata, modelName);
-    return new AuditQuery<T>(this.client, model);
+    return new AuditQuery<T>(this.client, this.metadata, model);
   }
 
   /** Envers-shaped entry point: `createQuery().forEntity("Product")`. */
@@ -57,11 +63,14 @@ export class AuditReader {
       userId: row.userId ?? null,
       username: row.username ?? null,
       changes: auditable.flatMap((model) =>
-        (row[model.auditDelegate] ?? []).map((entry: any) => ({
-          model: model.name,
-          revType: entry.revType,
-          id: entry[model.primaryKey as string],
-        })),
+        (row[model.auditDelegate] ?? []).map((entry: any) => {
+          const key = keyOf(model, entry) ?? {};
+          return {
+            model: model.name,
+            revType: entry.revType,
+            id: isComposite(model) ? key : key[model.primaryKey[0] as string],
+          };
+        }),
       ),
     }));
   }

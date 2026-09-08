@@ -74,9 +74,9 @@ function revisionModel(models: AuditModel[]): string[] {
 
 function auditModel(model: AuditModel, withIndexes: boolean): string[] {
   const fields = auditedFields(model);
-  const primaryKey = model.primaryKey;
+  const key = model.primaryKey;
 
-  if (!primaryKey) {
+  if (key.length === 0) {
     throw new Error(`Model ${model.name} has no primary key to audit against`);
   }
 
@@ -91,17 +91,18 @@ function auditModel(model: AuditModel, withIndexes: boolean): string[] {
   const width = Math.max(...fields.map((field) => field.name.length));
 
   for (const field of fields) {
-    const isPrimaryKey = field.name === primaryKey;
-    out.push(`  ${field.name.padEnd(width)} ${auditColumnType(field, isPrimaryKey)}`);
+    out.push(`  ${field.name.padEnd(width)} ${auditColumnType(field, key.includes(field.name))}`);
   }
 
   out.push("");
-  out.push(`  @@id([revisionId, ${primaryKey}])`);
+  // The source model's own `@@id(name: ...)` is not carried over: the audit
+  // key is a different key, and its Prisma-side name follows from the columns.
+  out.push(`  @@id([revisionId, ${key.join(", ")}])`);
 
   if (withIndexes) {
-    // The hot path is `WHERE <pk> = ? AND revision_id <= ? ORDER BY revision_id DESC`,
+    // The hot path is `WHERE <key> = ? AND revision_id <= ? ORDER BY revision_id DESC`,
     // which this composite index serves directly.
-    out.push(`  @@index([${primaryKey}, revisionId])`);
+    out.push(`  @@index([${key.join(", ")}, revisionId])`);
     out.push("  @@index([revisionId])");
   }
 
@@ -115,12 +116,12 @@ function auditModel(model: AuditModel, withIndexes: boolean): string[] {
  *
  * Non-key columns are always emitted as optional, because a column added to the
  * source model later has no value in the revisions recorded before it existed.
- * The primary key stays required — it is part of `@@id([revisionId, <pk>])`,
- * and Prisma does not allow an optional field in a composite id.
+ * Key columns stay required — they are part of `@@id([revisionId, ...])`, and
+ * Prisma does not allow an optional field in a composite id.
  */
-function auditColumnType(field: AuditField, isPrimaryKey: boolean): string {
+function auditColumnType(field: AuditField, isKeyColumn: boolean): string {
   const kept = stripAuditAttributes(field.attributes);
 
-  const type = isPrimaryKey ? field.type : `${field.type}?`;
+  const type = isKeyColumn ? field.type : `${field.type}?`;
   return kept ? `${type} ${kept}` : type;
 }

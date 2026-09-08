@@ -4,8 +4,35 @@ import {
   type AuditModel,
 } from "../metadata.js";
 import {
+  batchSize,
+  keyFromWhere,
+  keyIdentity,
+  keyOf,
+  keySelect,
+  whereAnyOf,
+  whereAuditRow,
+  whereUnique,
+  type EntityKey,
+} from "../util/keys.js";
+import {
+  recordNested,
+  scanNestedWrites,
+  snapshotNested,
+  type NestedGap,
+  type NestedPlan,
+} from "./nested.js";
+import {
+  publishRevision,
+  resolveEnforcement,
+  triggerWrites,
+  type Enforcement,
+  type TriggerMode,
+} from "./enforcement.js";
+import { chunks, readByKeys, CHUNK_SIZE } from "./read.js";
+import {
   getAuditContext,
   runWithAuditContext,
+  type AuditContext,
   type AuditUser,
 } from "./context.js";
 
@@ -28,21 +55,19 @@ export type PrismaClientLike = {
   $transaction: (...args: any[]) => any;
 };
 
-/** Operations whose result is the complete row, so they can be audited today. */
-const AUDITED_OPERATIONS = new Set(["create", "update", "delete"]);
+/** Writes that affect exactly one row. */
+const SINGLE_ROW_OPERATIONS = new Set(["create", "update", "delete", "upsert"]);
 
 /**
- * Write operations that touch audited models but are not recorded yet. They
- * either affect many rows at once or branch at runtime, so they need a
- * read-before-write strategy of their own.
+ * Writes that affect an unknown number of rows. Each one needs a read to learn
+ * which rows it touched, because the statement itself only reports a count.
  */
-const UNSUPPORTED_OPERATIONS = new Set([
+const BULK_OPERATIONS = new Set([
   "createMany",
   "createManyAndReturn",
   "updateMany",
   "updateManyAndReturn",
   "deleteMany",
-  "upsert",
 ]);
 
 const REV_TYPE: Record<string, string> = {
@@ -50,6 +75,12 @@ const REV_TYPE: Record<string, string> = {
   update: "UPDATE",
   delete: "DELETE",
 };
+
+/** Providers whose `createManyAndReturn` also accepts `skipDuplicates`. */
+const SKIP_DUPLICATES_PROVIDERS = new Set(["postgresql", "postgres", "cockroachdb"]);
+
+/** Prisma's error code for a unique constraint violation. */
+const UNIQUE_VIOLATION = "P2002";
 
 /**
  * What to do when an audited write happens outside `$auditTransaction`.
@@ -68,8 +99,25 @@ export interface AuditOptions {
   userProvider?: () => AuditUser | undefined | Promise<AuditUser | undefined>;
   /** Default: `"transaction"`. */
   onMissingRevision?: MissingRevisionPolicy;
-  /** Called once per unsupported operation. Default: `console.warn`. */
-  onUnsupportedOperation?: (model: string, operation: string) => void;
+  /**
+   * Overrides the `datasource` provider recorded in the metadata. Only affects
+   * which strategy `createMany` uses, and is rarely needed.
+   */
+  provider?: string;
+  /**
+   * How this build and the database's triggers divide the work of recording.
+   * Default: `"auto"`, which is metadata-driven and costs nothing at all when
+   * no model carries `[AuditTriggers]`.
+   */
+  triggers?: TriggerMode;
+  /**
+   * Called once per relation when a write reaches an audited model through a
+   * nested payload that prisma-audit cannot follow — an implicit many-to-many,
+   * or two relations to one model with no `@relation("name")` to tell them
+   * apart. A nested write it *can* follow is audited, not reported here.
+   * Default: `console.warn`.
+   */
+  onNestedWrite?: (model: string, relationField: string, targetModel: string) => void;
 }
 
 interface ClientBox {
@@ -83,15 +131,37 @@ interface OperationParams {
   query: (args: any) => Promise<any>;
 }
 
+/** One audit row waiting to be written: the row's state and how it got there. */
+interface AuditEntry {
+  state: Record<string, unknown>;
+  revType: string;
+}
+
+/** What an audited operation produced: its own result, plus what to record. */
+interface Outcome {
+  result: unknown;
+  entries: AuditEntry[];
+  /**
+   * The full row a single-row write left behind, which is what says who is
+   * related to it now. Absent for a bulk write, which cannot nest.
+   */
+  parentState?: Record<string, unknown>;
+}
+
 export function buildQueryExtension(box: ClientBox, options: AuditOptions) {
   const warned = new Set<string>();
+  // Resolved once, at construction: it is a property of the build and its
+  // metadata, so nothing about it can change from one write to the next, and a
+  // misconfiguration is reported while the client is being built rather than
+  // on whichever write happens to reach it first.
+  const enforcement = resolveEnforcement(options);
 
   return {
     name: "prisma-audit",
     query: {
       $allModels: {
         async $allOperations(params: OperationParams) {
-          return intercept(box, options, warned, params);
+          return intercept(box, options, enforcement, warned, params);
         },
       },
     },
@@ -101,22 +171,43 @@ export function buildQueryExtension(box: ClientBox, options: AuditOptions) {
 async function intercept(
   box: ClientBox,
   options: AuditOptions,
+  enforcement: Enforcement | undefined,
   warned: Set<string>,
   { model, operation, args, query }: OperationParams,
 ): Promise<unknown> {
   if (!model) return query(args);
 
-  const auditModel = findAuditable(options.metadata, model);
-  if (!auditModel) return query(args);
+  const source = options.metadata.models.find((candidate) => candidate.name === model);
+  if (!source) return query(args);
 
-  if (!AUDITED_OPERATIONS.has(operation)) {
-    if (UNSUPPORTED_OPERATIONS.has(operation)) {
-      warnUnsupported(options, warned, model, operation);
-    }
-    return query(args);
-  }
+  const isWrite =
+    SINGLE_ROW_OPERATIONS.has(operation) || BULK_OPERATIONS.has(operation);
+  if (!isWrite) return query(args);
 
   const context = getAuditContext();
+
+  // A call prisma-audit made itself, to read back or re-issue the work of the
+  // operation it is already recording. Auditing it again would duplicate rows.
+  if (context.bypass) return query(args);
+
+  const nested = scanNestedWrites(options.metadata, source, operation, args);
+  warnNestedGaps(options, warned, source, operation, nested.gaps);
+
+  // A relation whose rows the database records needs none of the reads that
+  // follow a nested write: the trigger sees each child row as it is written.
+  const plans = nested.plans.filter((plan) => !triggerWrites(enforcement, plan.target));
+
+  // A model that is not itself audited still matters when the write reaches one
+  // that is, e.g. `category.update({ data: { products: { update: … } } })`.
+  if (!source.auditable && plans.length === 0) return query(args);
+
+  // Nothing here is the runtime's to record. The write still opens a revision,
+  // because the trigger has to attach its rows to one and only the application
+  // knows who is acting -- but it is issued as the caller wrote it, with none
+  // of the reads auditing it in the runtime would cost.
+  if (triggerWrites(enforcement, source) && plans.length === 0 && context.revisionId !== undefined) {
+    return query(args);
+  }
 
   if (context.revisionId === undefined) {
     const policy = options.onMissingRevision ?? "transaction";
@@ -129,10 +220,10 @@ async function intercept(
       );
     }
 
-    return openRevisionFor(box, options, auditModel, operation, args);
+    return openRevisionFor(box, options, enforcement, source, operation, args);
   }
 
-  return record(options, auditModel, operation, args, query, context.revisionId, context.tx);
+  return record(options, enforcement, source, operation, args, query, context, plans);
 }
 
 /**
@@ -144,6 +235,7 @@ async function intercept(
 async function openRevisionFor(
   box: ClientBox,
   options: AuditOptions,
+  enforcement: Enforcement | undefined,
   model: AuditModel,
   operation: string,
   args: any,
@@ -151,31 +243,103 @@ async function openRevisionFor(
   const user = await resolveUser(options);
 
   return box.client.$transaction(async (tx: AnyClient) => {
-    const revision = await createRevision(tx, user);
+    const revision = await openRevision(tx, enforcement, user);
 
     // The operation must be awaited *inside* the context scope: a Prisma model
     // call returns a lazy promise, and if it were handed back unawaited it
     // would start executing after the scope had already been left. The
     // re-dispatch would then see no revision and open another transaction,
     // recursively, until the connection pool ran dry.
-    return runWithAuditContext({ user, revisionId: revision.id, tx }, async () => {
-      return await tx[model.delegate][operation](args);
-    });
+    return runWithAuditContext(
+      { user, revisionId: revision.id, tx, written: new Map() },
+      async () => {
+        return await tx[model.delegate][operation](args);
+      },
+    );
   });
 }
 
-/** Run the operation, then write its audit row on the same transaction. */
+/** Run the operation, then write its audit rows on the same transaction. */
 async function record(
   options: AuditOptions,
+  enforcement: Enforcement | undefined,
   model: AuditModel,
   operation: string,
   args: any,
   query: (args: any) => Promise<any>,
-  revisionId: bigint,
-  tx: unknown,
+  context: AuditContext,
+  plans: NestedPlan[],
 ): Promise<unknown> {
-  const client = tx as AnyClient;
+  const client = context.tx as AnyClient;
+
+  // Read the rows the nested payload could touch before the write runs: once it
+  // has, a row it deleted is beyond reach.
+  const snapshots =
+    plans.length > 0 ? await snapshotNested(client, model, operation, args, plans) : [];
+
+  // A model the triggers record is run exactly as the caller wrote it, the way
+  // an unaudited one is: the extra read a bulk statement would need to learn
+  // which rows it touched is the trigger's job now, one row at a time.
+  const outcome = !model.auditable || triggerWrites(enforcement, model)
+    ? { result: await query(args), entries: [] }
+    : BULK_OPERATIONS.has(operation)
+      ? await runBulk(options, client, model, operation, args, query)
+      : await runSingleRow(client, model, operation, args, query);
+
+  await writeAuditRows(client, model, context, outcome.entries);
+
+  for (const nested of snapshots.length > 0
+    ? await recordNested(client, snapshots, await parentState(client, model, args, outcome))
+    : []) {
+    await writeAuditRows(client, nested.model, context, nested.entries);
+  }
+
+  return outcome.result;
+}
+
+/**
+ * The parent row as it stands after the write, which is what says who is
+ * related to it now. An audited write has already resolved that state; an
+ * unaudited one has whatever Prisma returned, re-read when `select` narrowed it.
+ */
+async function parentState(
+  client: AnyClient,
+  model: AuditModel,
+  args: any,
+  outcome: Outcome,
+): Promise<Record<string, unknown>> {
+  if (outcome.parentState) return outcome.parentState;
+
+  const result = (outcome.result ?? {}) as Record<string, unknown>;
+  if (!usesProjection(args)) return result;
+
+  const key = keyOf(model, result) ?? keyFromWhere(model, args?.where);
+  if (!key) return result;
+
+  return (
+    ((await client[model.delegate].findUnique({ where: whereUnique(model, key) })) as
+      | Record<string, unknown>
+      | null) ?? result
+  );
+}
+
+/* -------------------------------------------------------------------------- */
+/* Single-row writes                                                           */
+/* -------------------------------------------------------------------------- */
+
+async function runSingleRow(
+  client: AnyClient,
+  model: AuditModel,
+  operation: string,
+  args: any,
+  query: (args: any) => Promise<any>,
+): Promise<Outcome> {
   const projected = usesProjection(args);
+
+  // `upsert` branches inside the database, so the only way to know whether the
+  // revision is an INSERT or an UPDATE is to look before the write.
+  const existed =
+    operation === "upsert" ? await rowExists(client, model, args?.where) : false;
 
   // A projected delete cannot be reconstructed afterwards — the row is gone.
   const before =
@@ -185,25 +349,41 @@ async function record(
 
   const result = await query(args);
 
-  const state = await resolveState(client, model, operation, args, result, before, projected);
+  const state = await resolveState(
+    client,
+    model,
+    operation,
+    args,
+    result,
+    before,
+    projected,
+  );
 
-  await client[model.auditDelegate].create({
-    data: {
-      revisionId,
-      revType: REV_TYPE[operation],
-      ...pickAuditedFields(model, state),
-    },
+  const revType =
+    operation === "upsert" ? (existed ? "UPDATE" : "INSERT") : (REV_TYPE[operation] as string);
+
+  return { result, entries: [{ state, revType }], parentState: state };
+}
+
+async function rowExists(
+  client: AnyClient,
+  model: AuditModel,
+  where: any,
+): Promise<boolean> {
+  const row = await client[model.delegate].findUnique({
+    where,
+    select: keySelect(model),
   });
-
-  return result;
+  return row !== null && row !== undefined;
 }
 
 /**
  * The full row as it stands after the operation.
  *
- * Prisma returns the complete record for `create`, `update` and `delete`, so
- * the common case needs no extra query. A caller-supplied `select`/`omit`
- * narrows that result, and the row is re-read to fill the audit table.
+ * Prisma returns the complete record for `create`, `update`, `upsert` and
+ * `delete`, so the common case needs no extra query. A caller-supplied
+ * `select`/`omit` narrows that result, and the row is re-read to fill the audit
+ * table.
  */
 async function resolveState(
   client: AnyClient,
@@ -223,17 +403,309 @@ async function resolveState(
     );
   }
 
-  const primaryKey = model.primaryKey as string;
-  const id = result?.[primaryKey] ?? args?.where?.[primaryKey];
+  // The narrowed result may still carry the key; failing that, a single-row
+  // write always names the row it targets in its own `where`.
+  const key = keyOf(model, result) ?? keyFromWhere(model, args?.where);
 
-  if (id === undefined) {
-    throw new Error(
-      `${model.name}.${operation}() uses select/omit without returning ${primaryKey}, ` +
-        `so prisma-audit cannot re-read the row. Include ${primaryKey} in the selection.`,
-    );
+  if (!key) throw new Error(missingKeyForReread(model, `${model.name}.${operation}()`, "row"));
+
+  return (
+    (await client[model.delegate].findUnique({ where: whereUnique(model, key) })) ?? {}
+  );
+}
+
+/* -------------------------------------------------------------------------- */
+/* Bulk writes                                                                 */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Bulk statements report a count, not the rows they touched, so each one is
+ * paired with a read: before the write when the rows are about to disappear or
+ * to stop matching the filter, after it when the new state is what matters.
+ * That is the documented cost of auditing them — one statement becomes two.
+ */
+async function runBulk(
+  options: AuditOptions,
+  client: AnyClient,
+  model: AuditModel,
+  operation: string,
+  args: any,
+  query: (args: any) => Promise<any>,
+): Promise<Outcome> {
+  switch (operation) {
+    case "createMany":
+      return createManyAudited(options, client, model, args);
+
+    case "createManyAndReturn":
+      return returnedRows(client, model, operation, args, await query(args), "INSERT");
+
+    case "updateManyAndReturn":
+      return returnedRows(client, model, operation, args, await query(args), "UPDATE");
+
+    case "updateMany":
+      return updateManyAudited(client, model, args, query);
+
+    case "deleteMany":
+      return deleteManyAudited(client, model, args, query);
+
+    default:
+      throw new Error(`prisma-audit has no strategy for ${model.name}.${operation}().`);
+  }
+}
+
+/**
+ * `createMany` reports only a count, and the rows carry database-generated
+ * keys, so there is nothing to audit unless the insert gives the rows back.
+ *
+ * `createManyAndReturn` does exactly that, and Prisma only puts it on the
+ * delegate for the databases that support it — which makes the delegate itself
+ * the capability check. Everywhere else the insert is replayed row by row.
+ */
+async function createManyAudited(
+  options: AuditOptions,
+  client: AnyClient,
+  model: AuditModel,
+  args: any,
+): Promise<Outcome> {
+  if (canInsertReturning(options, client, model, args)) {
+    const created: any[] = await runBypassed(client, model, "createManyAndReturn", args);
+    return {
+      result: { count: created.length },
+      entries: created.map((state) => ({ state, revType: "INSERT" })),
+    };
   }
 
-  return (await client[model.delegate].findUnique({ where: { [primaryKey]: id } })) ?? {};
+  const rows = Array.isArray(args?.data) ? args.data : [args?.data];
+  const created: any[] = [];
+
+  for (const data of rows) {
+    if (data === undefined) continue;
+
+    try {
+      created.push(await runBypassed(client, model, "create", { data }));
+    } catch (error) {
+      if (args?.skipDuplicates && isUniqueViolation(error)) continue;
+      throw error;
+    }
+  }
+
+  return {
+    result: { count: created.length },
+    entries: created.map((state) => ({ state, revType: "INSERT" })),
+  };
+}
+
+function canInsertReturning(
+  options: AuditOptions,
+  client: AnyClient,
+  model: AuditModel,
+  args: any,
+): boolean {
+  if (typeof client[model.delegate]?.createManyAndReturn !== "function") return false;
+  if (!args?.skipDuplicates) return true;
+
+  // SQLite has `createManyAndReturn` but rejects `skipDuplicates` on it.
+  const provider = options.provider ?? options.metadata.provider;
+  return provider !== undefined && SKIP_DUPLICATES_PROVIDERS.has(provider);
+}
+
+/** An operation that already hands back the rows it wrote. */
+async function returnedRows(
+  client: AnyClient,
+  model: AuditModel,
+  operation: string,
+  args: any,
+  result: any[],
+  revType: string,
+): Promise<Outcome> {
+  const states = await hydrate(client, model, operation, args, result);
+  return { result, entries: states.map((state) => ({ state, revType })) };
+}
+
+async function updateManyAudited(
+  client: AnyClient,
+  model: AuditModel,
+  args: any,
+  query: (args: any) => Promise<any>,
+): Promise<Outcome> {
+  const limited = args?.limit !== undefined;
+
+  const targets: any[] = await client[model.delegate].findMany({
+    where: args?.where,
+    select: keySelect(model),
+    ...(limited ? { take: args.limit } : {}),
+  });
+
+  const keys = targets.map((row) => keyOf(model, row) as EntityKey);
+
+  // With `limit` the database decides which of the matching rows to touch, and
+  // that need not be the set just read. Re-issuing the update against those
+  // keys makes the two statements agree instead of hoping that they do.
+  const result = limited
+    ? await runBypassed(client, model, "updateMany", withKeyFilter(args, model, keys))
+    : await query(args);
+
+  const states = await readByKeys(client, model, keys);
+
+  return { result, entries: states.map((state) => ({ state, revType: "UPDATE" })) };
+}
+
+async function deleteManyAudited(
+  client: AnyClient,
+  model: AuditModel,
+  args: any,
+  query: (args: any) => Promise<any>,
+): Promise<Outcome> {
+  const limited = args?.limit !== undefined;
+
+  // Read the whole row, not just the key: after the delete there is nothing
+  // left to go back for.
+  const doomed: any[] = await client[model.delegate].findMany({
+    where: args?.where,
+    ...(limited ? { take: args.limit } : {}),
+  });
+
+  const result = limited
+    ? await runBypassed(
+        client,
+        model,
+        "deleteMany",
+        withKeyFilter(
+          args,
+          model,
+          doomed.map((row) => keyOf(model, row) as EntityKey),
+        ),
+      )
+    : await query(args);
+
+  return { result, entries: doomed.map((state) => ({ state, revType: "DELETE" })) };
+}
+
+/** The same arguments, narrowed to a fixed set of rows and without `limit`. */
+function withKeyFilter(args: any, model: AuditModel, keys: EntityKey[]): any {
+  const { limit: _limit, where: _where, ...rest } = args ?? {};
+  return { ...rest, where: whereAnyOf(model, keys) };
+}
+
+/**
+ * Fill in rows that came back narrowed by `select`/`omit`. The audit table
+ * needs every audited column, so the rows are re-read by primary key.
+ */
+async function hydrate(
+  client: AnyClient,
+  model: AuditModel,
+  operation: string,
+  args: any,
+  rows: any[],
+): Promise<Record<string, unknown>[]> {
+  if (!usesProjection(args)) return rows ?? [];
+
+  const keys = (rows ?? []).map((row) => keyOf(model, row));
+
+  if (keys.some((key) => key === null)) {
+    throw new Error(missingKeyForReread(model, `${model.name}.${operation}()`, "rows"));
+  }
+
+  return readByKeys(client, model, keys as EntityKey[]);
+}
+
+/** The one message both re-read paths need, naming every column of the key. */
+function missingKeyForReread(model: AuditModel, call: string, rows: string): string {
+  const columns = model.primaryKey.join(", ");
+  return (
+    `${call} uses select/omit without returning ${columns}, so prisma-audit cannot ` +
+    `re-read the ${rows}. Include ${columns} in the selection.`
+  );
+}
+
+/**
+ * Re-dispatch an operation on the client for prisma-audit's own purposes. The
+ * call goes through the extension again, so it is marked as a bypass to keep it
+ * from being audited a second time.
+ *
+ * As everywhere else, the call is awaited inside the scope: a Prisma model call
+ * is lazy, and an unawaited promise would run once the scope had been left.
+ */
+function runBypassed(
+  client: AnyClient,
+  model: AuditModel,
+  operation: string,
+  args: any,
+): Promise<any> {
+  const context = getAuditContext();
+
+  return runWithAuditContext({ ...context, bypass: true }, async () => {
+    return await client[model.delegate][operation](args);
+  });
+}
+
+function isUniqueViolation(error: unknown): boolean {
+  return (error as { code?: string } | null)?.code === UNIQUE_VIOLATION;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Writing the audit rows                                                      */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Write one audit row per changed row.
+ *
+ * An audit table is keyed `(revisionId, id)`, so a row touched twice in the
+ * same revision updates the record it already has rather than inserting a
+ * second one — the revision keeps the state the row ended up in. A row created
+ * and then changed within one revision stays an INSERT, because that is what
+ * the revision did to it.
+ */
+async function writeAuditRows(
+  client: AnyClient,
+  model: AuditModel,
+  context: AuditContext,
+  entries: AuditEntry[],
+): Promise<void> {
+  if (entries.length === 0) return;
+
+  const revisionId = context.revisionId as bigint;
+  const written = (context.written ??= new Map());
+
+  /** Rows not yet in the audit table, so they can be inserted in one go. */
+  const pending = new Map<string, Record<string, unknown>>();
+
+  for (const entry of entries) {
+    const key = keyOf(model, entry.state);
+
+    if (!key) {
+      throw new Error(
+        `${model.name}: an audited write produced a row without ${model.primaryKey.join(", ")}, ` +
+          `so it cannot be recorded.`,
+      );
+    }
+
+    const identity = `${model.name}#${keyIdentity(model, key)}`;
+    const previous = written.get(identity);
+    const revType =
+      previous === "INSERT" && entry.revType === "UPDATE" ? "INSERT" : entry.revType;
+
+    const data = {
+      revisionId,
+      revType,
+      ...pickAuditedFields(model, entry.state),
+    };
+
+    if (previous === undefined || pending.has(identity)) {
+      pending.set(identity, data);
+    } else {
+      await client[model.auditDelegate].update({
+        where: whereAuditRow(model, revisionId, key),
+        data,
+      });
+    }
+
+    written.set(identity, revType);
+  }
+
+  for (const chunk of chunks([...pending.values()], batchSize(model, CHUNK_SIZE))) {
+    await client[model.auditDelegate].createMany({ data: chunk });
+  }
 }
 
 function usesProjection(args: any): boolean {
@@ -254,6 +726,23 @@ function pickAuditedFields(
   return data;
 }
 
+/**
+ * Open the revision a unit of work records under, and publish it.
+ *
+ * The row and the transaction-local settings are written together, because a
+ * trigger firing later in the same transaction has to find the same revision
+ * the runtime is using -- otherwise one write would be split across two.
+ */
+export async function openRevision(
+  tx: AnyClient,
+  enforcement: Enforcement | undefined,
+  user: AuditUser | undefined,
+): Promise<{ id: bigint }> {
+  const revision = await createRevision(tx, user);
+  if (enforcement) await publishRevision(tx, enforcement, revision.id, user);
+  return revision;
+}
+
 export async function createRevision(
   tx: AnyClient,
   user: AuditUser | undefined,
@@ -270,27 +759,31 @@ export async function resolveUser(options: AuditOptions): Promise<AuditUser | un
   return options.userProvider ? await options.userProvider() : undefined;
 }
 
-function findAuditable(metadata: AuditMetadata, modelName: string): AuditModel | undefined {
-  const model = metadata.models.find((candidate) => candidate.name === modelName);
-  return model?.auditable ? model : undefined;
-}
-
-function warnUnsupported(
+/**
+ * A relation prisma-audit cannot follow: an implicit many-to-many names no join
+ * columns, and two relations to one model with no `@relation("name")` cannot be
+ * told apart. Rather than leave a silent hole in the history, say so once.
+ */
+function warnNestedGaps(
   options: AuditOptions,
   warned: Set<string>,
-  model: string,
+  model: AuditModel,
   operation: string,
+  gaps: NestedGap[],
 ): void {
-  const key = `${model}.${operation}`;
-  if (warned.has(key)) return;
-  warned.add(key);
+  for (const gap of gaps) {
+    const id = `${model.name}.${gap.relation}`;
+    if (warned.has(id)) continue;
+    warned.add(id);
 
-  if (options.onUnsupportedOperation) {
-    options.onUnsupportedOperation(model, operation);
-    return;
+    if (options.onNestedWrite) {
+      options.onNestedWrite(model.name, gap.relation, gap.target);
+      continue;
+    }
+
+    console.warn(
+      `[prisma-audit] ${model.name}.${operation}() writes ${gap.target} through the nested relation "${gap.relation}", ` +
+        `whose join columns the schema does not name, so prisma-audit cannot find those rows to record them.`,
+    );
   }
-
-  console.warn(
-    `[prisma-audit] ${key}() is not audited yet; the rows it changes will have no revision history.`,
-  );
 }

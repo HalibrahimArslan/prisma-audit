@@ -1,4 +1,7 @@
-import { auditedFields, type AuditModel } from "../metadata.js";
+import { auditedFields, type AuditMetadata, type AuditModel } from "../metadata.js";
+import { isComposite, keyOf, type EntityKey } from "../util/keys.js";
+import { sameValue } from "../util/values.js";
+import { AggregateQuery } from "./aggregate-query.js";
 
 export type RevisionType = "INSERT" | "UPDATE" | "DELETE";
 
@@ -31,17 +34,42 @@ type AnyClient = any;
  *     await prisma.audit.for("Product").id(10).atRevision(120n);
  */
 export class AuditQuery<T = Record<string, unknown>> {
-  private idValue: unknown;
+  private key: EntityKey | undefined;
 
   constructor(
     private readonly client: AnyClient,
+    private readonly metadata: AuditMetadata,
     private readonly model: AuditModel,
   ) {}
 
-  /** Restrict the query to one row of the source model. */
+  /**
+   * Restrict the query to one row of the source model.
+   *
+   * A single-column key is given as the value itself; a composite key as an
+   * object naming every column, `id({ orderId: 1, lineNo: 2 })`. Both forms are
+   * exactly what `AuditReader.revisions()` reports for a change, so a summary
+   * can be handed straight back to `.id()`.
+   */
   id(value: unknown): this {
-    this.idValue = value;
+    this.key = this.toKey(value);
     return this;
+  }
+
+  /**
+   * Read this row together with the rows that belong to it: the relations
+   * marked `[AuditedRelation]`, or the ones named here.
+   *
+   *     await prisma.audit.for("Order").id(1).aggregate().atRevision(120n);
+   */
+  aggregate(...relations: string[]): AggregateQuery<T> {
+    return new AggregateQuery<T>(
+      this.client,
+      this.metadata,
+      this.model,
+      this.whereId(),
+      (revisionId) => this.atRevision(revisionId),
+      relations,
+    );
   }
 
   /** Every recorded revision of the row, oldest first. */
@@ -125,21 +153,36 @@ export class AuditQuery<T = Record<string, unknown>> {
   }
 
   private whereId(): Record<string, unknown> {
-    if (this.idValue === undefined) {
-      throw new Error(
-        `Call .id(...) before querying the history of ${this.model.name}.`,
-      );
+    if (!this.key) {
+      throw new Error(`Call .id(...) before querying the history of ${this.model.name}.`);
     }
-    return { [this.model.primaryKey as string]: this.idValue };
+    // The audit table carries the key columns as ordinary columns, so they
+    // filter flatly here even when the source model's key is composite.
+    return { ...this.key };
+  }
+
+  /** Read the argument of `.id()` as a full key, or explain what is missing. */
+  private toKey(value: unknown): EntityKey {
+    const columns = this.model.primaryKey;
+    const fromObject = keyOf(this.model, value);
+
+    if (fromObject) return fromObject;
+
+    // A single-column key is normally passed as the bare value — which may
+    // itself be an object, e.g. a `DateTime` or a `Bytes` key.
+    if (!isComposite(this.model) && value !== undefined) {
+      return { [columns[0] as string]: value };
+    }
+
+    throw new Error(
+      `${this.model.name} has a composite primary key, so .id() needs every column: ` +
+        `.id({ ${columns.map((column) => `${column}: …`).join(", ")} })`,
+    );
   }
 
   /** Split a raw audit row into revision bookkeeping and entity state. */
   private toEntry(row: any): AuditRevisionEntry<T> {
-    const entity: Record<string, unknown> = {};
-
-    for (const field of auditedFields(this.model)) {
-      entity[field.name] = row[field.name];
-    }
+    const entity = toEntity(this.model, row);
 
     return {
       revisionId: row.revisionId,
@@ -155,21 +198,18 @@ export class AuditQuery<T = Record<string, unknown>> {
 }
 
 /**
- * Value equality that is good enough for audit diffs: `Decimal`, `BigInt` and
- * `Date` all compare correctly through their string form, while plain scalars
- * fall back to `Object.is`.
+ * The entity half of an audit row: the columns of the source model, without the
+ * revision bookkeeping the audit table adds alongside them.
  */
-function sameValue(a: unknown, b: unknown): boolean {
-  if (Object.is(a, b)) return true;
-  if (a === null || b === null) return false;
+export function toEntity(
+  model: AuditModel,
+  row: Record<string, unknown>,
+): Record<string, unknown> {
+  const entity: Record<string, unknown> = {};
 
-  if (a instanceof Date && b instanceof Date) {
-    return a.getTime() === b.getTime();
+  for (const field of auditedFields(model)) {
+    entity[field.name] = row[field.name];
   }
 
-  if (typeof a === "object" || typeof b === "object") {
-    return String(a) === String(b);
-  }
-
-  return false;
+  return entity;
 }
