@@ -21,6 +21,13 @@ import {
   type NestedGap,
   type NestedPlan,
 } from "./nested.js";
+import {
+  publishRevision,
+  resolveEnforcement,
+  triggerWrites,
+  type Enforcement,
+  type TriggerMode,
+} from "./enforcement.js";
 import { chunks, readByKeys, CHUNK_SIZE } from "./read.js";
 import {
   getAuditContext,
@@ -98,6 +105,12 @@ export interface AuditOptions {
    */
   provider?: string;
   /**
+   * How this build and the database's triggers divide the work of recording.
+   * Default: `"auto"`, which is metadata-driven and costs nothing at all when
+   * no model carries `[AuditTriggers]`.
+   */
+  triggers?: TriggerMode;
+  /**
    * Called once per relation when a write reaches an audited model through a
    * nested payload that prisma-audit cannot follow — an implicit many-to-many,
    * or two relations to one model with no `@relation("name")` to tell them
@@ -137,13 +150,18 @@ interface Outcome {
 
 export function buildQueryExtension(box: ClientBox, options: AuditOptions) {
   const warned = new Set<string>();
+  // Resolved once, at construction: it is a property of the build and its
+  // metadata, so nothing about it can change from one write to the next, and a
+  // misconfiguration is reported while the client is being built rather than
+  // on whichever write happens to reach it first.
+  const enforcement = resolveEnforcement(options);
 
   return {
     name: "prisma-audit",
     query: {
       $allModels: {
         async $allOperations(params: OperationParams) {
-          return intercept(box, options, warned, params);
+          return intercept(box, options, enforcement, warned, params);
         },
       },
     },
@@ -153,6 +171,7 @@ export function buildQueryExtension(box: ClientBox, options: AuditOptions) {
 async function intercept(
   box: ClientBox,
   options: AuditOptions,
+  enforcement: Enforcement | undefined,
   warned: Set<string>,
   { model, operation, args, query }: OperationParams,
 ): Promise<unknown> {
@@ -174,9 +193,21 @@ async function intercept(
   const nested = scanNestedWrites(options.metadata, source, operation, args);
   warnNestedGaps(options, warned, source, operation, nested.gaps);
 
+  // A relation whose rows the database records needs none of the reads that
+  // follow a nested write: the trigger sees each child row as it is written.
+  const plans = nested.plans.filter((plan) => !triggerWrites(enforcement, plan.target));
+
   // A model that is not itself audited still matters when the write reaches one
   // that is, e.g. `category.update({ data: { products: { update: … } } })`.
-  if (!source.auditable && nested.plans.length === 0) return query(args);
+  if (!source.auditable && plans.length === 0) return query(args);
+
+  // Nothing here is the runtime's to record. The write still opens a revision,
+  // because the trigger has to attach its rows to one and only the application
+  // knows who is acting -- but it is issued as the caller wrote it, with none
+  // of the reads auditing it in the runtime would cost.
+  if (triggerWrites(enforcement, source) && plans.length === 0 && context.revisionId !== undefined) {
+    return query(args);
+  }
 
   if (context.revisionId === undefined) {
     const policy = options.onMissingRevision ?? "transaction";
@@ -189,10 +220,10 @@ async function intercept(
       );
     }
 
-    return openRevisionFor(box, options, source, operation, args);
+    return openRevisionFor(box, options, enforcement, source, operation, args);
   }
 
-  return record(options, source, operation, args, query, context, nested.plans);
+  return record(options, enforcement, source, operation, args, query, context, plans);
 }
 
 /**
@@ -204,6 +235,7 @@ async function intercept(
 async function openRevisionFor(
   box: ClientBox,
   options: AuditOptions,
+  enforcement: Enforcement | undefined,
   model: AuditModel,
   operation: string,
   args: any,
@@ -211,7 +243,7 @@ async function openRevisionFor(
   const user = await resolveUser(options);
 
   return box.client.$transaction(async (tx: AnyClient) => {
-    const revision = await createRevision(tx, user);
+    const revision = await openRevision(tx, enforcement, user);
 
     // The operation must be awaited *inside* the context scope: a Prisma model
     // call returns a lazy promise, and if it were handed back unawaited it
@@ -230,6 +262,7 @@ async function openRevisionFor(
 /** Run the operation, then write its audit rows on the same transaction. */
 async function record(
   options: AuditOptions,
+  enforcement: Enforcement | undefined,
   model: AuditModel,
   operation: string,
   args: any,
@@ -244,7 +277,10 @@ async function record(
   const snapshots =
     plans.length > 0 ? await snapshotNested(client, model, operation, args, plans) : [];
 
-  const outcome = !model.auditable
+  // A model the triggers record is run exactly as the caller wrote it, the way
+  // an unaudited one is: the extra read a bulk statement would need to learn
+  // which rows it touched is the trigger's job now, one row at a time.
+  const outcome = !model.auditable || triggerWrites(enforcement, model)
     ? { result: await query(args), entries: [] }
     : BULK_OPERATIONS.has(operation)
       ? await runBulk(options, client, model, operation, args, query)
@@ -688,6 +724,23 @@ function pickAuditedFields(
   }
 
   return data;
+}
+
+/**
+ * Open the revision a unit of work records under, and publish it.
+ *
+ * The row and the transaction-local settings are written together, because a
+ * trigger firing later in the same transaction has to find the same revision
+ * the runtime is using -- otherwise one write would be split across two.
+ */
+export async function openRevision(
+  tx: AnyClient,
+  enforcement: Enforcement | undefined,
+  user: AuditUser | undefined,
+): Promise<{ id: bigint }> {
+  const revision = await createRevision(tx, user);
+  if (enforcement) await publishRevision(tx, enforcement, revision.id, user);
+  return revision;
 }
 
 export async function createRevision(

@@ -1,8 +1,9 @@
 import { AuditReader } from "../reader/audit-reader.js";
 import { runWithAuditContext, type AuditUser } from "./context.js";
+import { resolveEnforcement } from "./enforcement.js";
 import {
   buildQueryExtension,
-  createRevision,
+  openRevision,
   resolveUser,
   type AuditOptions,
   type PrismaClientLike,
@@ -64,6 +65,10 @@ export function withAudit<C extends PrismaClientLike>(
   // immediately afterwards and is only ever read from inside a query callback.
   const box = { client: undefined as unknown as AnyClient };
 
+  // Both halves of the client resolve this the same way, and both do it here
+  // rather than per transaction: it cannot change once the client is built.
+  const enforcement = resolveEnforcement(options);
+
   // The reader is handed to the client extension before the extended client
   // exists, so it reads through the box rather than capturing a client.
   const reader = new AuditReader(
@@ -95,7 +100,7 @@ export function withAudit<C extends PrismaClientLike>(
         const user = hasUser ? (userOrFn as AuditUser) : await resolveUser(options);
 
         return box.client.$transaction(async (tx: AnyClient) => {
-          const revision = await createRevision(tx, user);
+          const revision = await openRevision(tx, enforcement, user);
 
           // Awaited inside the scope on purpose: Prisma model calls are lazy,
           // so an unawaited promise would execute after the context had been

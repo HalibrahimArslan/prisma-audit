@@ -371,6 +371,8 @@ interface Harness {
   tagAud: FakeAuditTable;
   revision: FakeRevisionTable;
   warnings: string[];
+  /** The transaction-local settings each `set_config` statement published. */
+  published: Array<Record<string, string>>;
 }
 
 /**
@@ -395,6 +397,7 @@ function harness(overrides: Partial<AuditOptions> = {}, returning = true): Harne
   category.relations = { products: { table: product, foreignKey: "categoryId" } };
   const revision = new FakeRevisionTable();
   const warnings: string[] = [];
+  const published: Array<Record<string, string>> = [];
 
   const options: AuditOptions = {
     metadata,
@@ -407,6 +410,21 @@ function harness(overrides: Partial<AuditOptions> = {}, returning = true): Harne
 
   const client: any = {
     $transaction: async (fn: (tx: any) => Promise<unknown>) => fn(client),
+
+    /**
+     * `SELECT set_config($1, $2, true), …`, which is how the runtime publishes
+     * the revision to the triggers. The bound values are recorded as the
+     * settings map one statement produced.
+     */
+    $queryRawUnsafe: async (_sql: string, ...values: string[]) => {
+      const settings: Record<string, string> = {};
+      for (let index = 0; index < values.length; index += 2) {
+        settings[values[index] as string] = values[index + 1] as string;
+      }
+      published.push(settings);
+      return [];
+    },
+
     revision,
     productAud,
     stockAud,
@@ -453,6 +471,7 @@ function harness(overrides: Partial<AuditOptions> = {}, returning = true): Harne
     tagAud,
     revision,
     warnings,
+    published,
   };
 }
 
@@ -1016,5 +1035,152 @@ describe("nested writes", () => {
     );
 
     assert.deepEqual(h.warnings, []);
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+
+/** The same schema, with the named models handed over to database triggers. */
+function withTriggers(...models: string[]): AuditMetadata {
+  const copy = structuredClone(metadata);
+  for (const model of copy.models) {
+    if (models.includes(model.name)) model.triggers = true;
+  }
+  return copy;
+}
+
+describe("database triggers", () => {
+  it("publishes the revision and the acting user on the transaction", async () => {
+    const h = harness({
+      metadata: withTriggers("Product"),
+      userProvider: () => ({ userId: "42", username: "halil" }),
+    });
+    h.product.rows.push({ id: 1, name: "a", price: 10, internalCode: null, categoryId: null });
+
+    await h.client.product.update({ where: { id: 1 }, data: { price: 20 } });
+
+    assert.equal(h.revision.rows.length, 1);
+    assert.deepEqual(h.published, [
+      {
+        "prisma_audit.revision_id": "1",
+        "prisma_audit.user_id": "42",
+        "prisma_audit.username": "halil",
+        "prisma_audit.suppress": "",
+      },
+    ]);
+  });
+
+  it("leaves the audit row to the trigger, and pays for none of the reads", async () => {
+    const h = harness({ metadata: withTriggers("Product") });
+    h.product.rows.push({ id: 1, name: "a", price: 10, internalCode: null, categoryId: null });
+
+    await h.client.product.update({
+      where: { id: 1 },
+      data: { price: 20 },
+      select: { id: true },
+    });
+
+    // A projected write would otherwise be re-read to fill the audit row.
+    assert.deepEqual(h.product.calls, ["update"]);
+    assert.equal(h.productAud.rows.length, 0);
+  });
+
+  it("issues a bulk write as one statement, the trigger seeing each row", async () => {
+    const h = harness({ metadata: withTriggers("Product") });
+    h.product.rows.push(
+      { id: 1, name: "a", price: 10, internalCode: null, categoryId: null },
+      { id: 2, name: "b", price: 10, internalCode: null, categoryId: null },
+    );
+
+    const result = await inRevision(h, () =>
+      h.client.product.updateMany({ where: { price: 10 }, data: { price: 20 } }),
+    );
+
+    assert.deepEqual(result, { count: 2 });
+    // Auditing this in the runtime costs a read before and a read after.
+    assert.deepEqual(h.product.calls, ["updateMany"]);
+    assert.equal(h.productAud.rows.length, 0);
+  });
+
+  it("still records a model the triggers were not asked to cover", async () => {
+    const h = harness({ metadata: withTriggers("Product") });
+    h.stock.rows.push({ id: 7, productId: 1, quantity: 3 });
+
+    await h.client.stock.update({ where: { id: 7 }, data: { quantity: 5 } });
+
+    assert.equal(h.stockAud.rows.length, 1);
+    assert.equal(h.stockAud.rows[0]?.quantity, 5);
+    // The revision is published all the same: a trigger firing later in this
+    // same transaction has to record against the revision already open.
+    assert.equal(h.published[0]?.["prisma_audit.revision_id"], "1");
+  });
+
+  it("skips the reads a nested write would need for a trigger-backed child", async () => {
+    const h = harness({ metadata: withTriggers("Stock") });
+    h.product.rows.push({ id: 1, name: "a", price: 10, internalCode: null, categoryId: null });
+    h.stock.rows.push({ id: 7, productId: 1, quantity: 3 });
+
+    await inRevision(h, () =>
+      h.client.product.update({
+        where: { id: 1 },
+        data: { price: 20, stocks: { update: { where: { id: 7 }, data: { quantity: 5 } } } },
+      }),
+    );
+
+    assert.equal(h.productAud.rows.length, 1);
+    assert.equal(h.stockAud.rows.length, 0);
+    // Following the nested write would mean reading the related rows twice.
+    assert.ok(!h.stock.calls.includes("findMany"));
+  });
+
+  it("writes the rows itself and tells the triggers to stand down", async () => {
+    const h = harness({ metadata: withTriggers("Product"), triggers: "suppress" });
+    h.product.rows.push({ id: 1, name: "a", price: 10, internalCode: null, categoryId: null });
+
+    await h.client.product.update({ where: { id: 1 }, data: { price: 20 } });
+
+    assert.equal(h.published[0]?.["prisma_audit.suppress"], "on");
+    assert.equal(h.productAud.rows.length, 1);
+    assert.equal(h.productAud.rows[0]?.price, 20);
+  });
+
+  it("says nothing to the database under triggers: off", async () => {
+    const h = harness({ metadata: withTriggers("Product"), triggers: "off" });
+    h.product.rows.push({ id: 1, name: "a", price: 10, internalCode: null, categoryId: null });
+
+    await h.client.product.update({ where: { id: 1 }, data: { price: 20 } });
+
+    assert.deepEqual(h.published, []);
+    assert.equal(h.productAud.rows.length, 1);
+  });
+
+  it("costs a schema with no triggers nothing at all", async () => {
+    const h = harness();
+    h.product.rows.push({ id: 1, name: "a", price: 10, internalCode: null, categoryId: null });
+
+    await h.client.product.update({ where: { id: 1 }, data: { price: 20 } });
+
+    assert.deepEqual(h.published, []);
+    assert.equal(h.productAud.rows.length, 1);
+  });
+
+  it("refuses trigger-backed metadata on a database that cannot run them", () => {
+    const mysql = withTriggers("Product");
+    mysql.provider = "mysql";
+
+    assert.throws(
+      () => harness({ metadata: mysql }),
+      /\[AuditTriggers\].*PostgreSQL-only.*mysql/s,
+    );
+  });
+
+  it("refuses to suppress on a database that has no such setting", () => {
+    const sqlite = structuredClone(metadata);
+    sqlite.provider = "sqlite";
+
+    assert.throws(
+      () => harness({ metadata: sqlite, triggers: "suppress" }),
+      /suppress.*PostgreSQL.*sqlite/s,
+    );
   });
 });

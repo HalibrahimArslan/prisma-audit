@@ -62,6 +62,8 @@ export {
   type PrismaClientLike,
 } from "./runtime/extension.js";
 
+export { type TriggerMode } from "./runtime/enforcement.js";
+
 export {
   withAudit,
   type AuditablePrismaClient,
